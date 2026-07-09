@@ -1034,6 +1034,7 @@ dependencies = [
  "tls-parser",
  "tokio",
  "tokio-rustls",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
  "url",

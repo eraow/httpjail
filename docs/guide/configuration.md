@@ -88,10 +88,15 @@ These are automatically set in the jailed process:
 
 These affect httpjail's behavior:
 
-| Variable           | Description                | Example                          |
-| ------------------ | -------------------------- | -------------------------------- |
-| `RUST_LOG`         | Logging level              | `debug`, `info`, `warn`, `error` |
-| `HTTPJAIL_CA_CERT` | Custom CA certificate path | `/etc/pki/custom-ca.pem`         |
+| Variable                 | Description                            | Example                          |
+| ------------------------ | -------------------------------------- | -------------------------------- |
+| `RUST_LOG`               | Logging level                          | `debug`, `info`, `warn`, `error` |
+| `HTTPJAIL_CA_CERT`       | Custom CA certificate path             | `/etc/pki/custom-ca.pem`         |
+| `HTTPJAIL_UPSTREAM_PROXY`| Upstream proxy for httpjail's egress   | `http://proxy.corp:3128`         |
+
+The `--upstream-proxy` command-line flag takes precedence over
+`HTTPJAIL_UPSTREAM_PROXY`. See [Upstream Proxy](../advanced/upstream-proxy.md)
+for details.
 
 ## Platform-Specific Configuration
 

@@ -32,6 +32,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
 chrono = "0.4"
 dirs = "6.0.0"
 hyper-rustls = "0.27.7"
+tower-service = "0.3"
 tls-parser = "0.12.2"
 camino = "1.1.11"
 filetime = "0.2"
