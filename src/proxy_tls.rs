@@ -595,7 +595,7 @@ async fn proxy_https_request(
 
             // The hyper_util error doesn't expose underlying IO errors directly
 
-            return Err(e.into());
+            return Err(e);
         }
     };
 

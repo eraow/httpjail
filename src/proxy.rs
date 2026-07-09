@@ -3,6 +3,7 @@ use crate::dangerous_verifier::create_dangerous_client_config;
 use crate::rules::{Action, RuleEngine};
 #[allow(unused_imports)]
 use crate::tls::CertificateManager;
+use crate::upstream::{ProxyForwarder, UpstreamProxy};
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -12,8 +13,10 @@ use hyper::service::service_fn;
 use hyper::{Error as HyperError, Request, Response, StatusCode, Uri};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rand::Rng;
+use rustls::pki_types::CertificateDer;
 
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -158,13 +161,49 @@ pub fn apply_request_byte_limit(
     )))
 }
 
+/// Direct (no upstream proxy) upstream client type.
+type DirectClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<Bytes, HyperError>>;
+
+/// Upstream client that either contacts destinations directly or routes every
+/// re-originated request through a configured upstream (corporate) proxy. Both
+/// variants return the same response type so downstream request handling is
+/// identical regardless of how egress is performed.
+pub enum UpstreamClient {
+    // Boxed to keep the enum small: the pooled client is much larger than the
+    // proxy forwarder variant.
+    Direct(Box<DirectClient>),
+    Proxied(ProxyForwarder),
+}
+
+impl UpstreamClient {
+    /// Forward a prepared request upstream. No timeout is applied here so that
+    /// long-running connections (WebSocket, gRPC, ...) keep working.
+    pub async fn request(
+        &self,
+        req: Request<BoxBody<Bytes, HyperError>>,
+    ) -> Result<Response<Incoming>> {
+        match self {
+            UpstreamClient::Direct(client) => client.request(req).await.map_err(Into::into),
+            UpstreamClient::Proxied(forwarder) => forwarder.request(req).await,
+        }
+    }
+}
+
 // Shared HTTP/HTTPS client for upstream requests
-static HTTPS_CLIENT: OnceLock<
-    Client<
-        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-        BoxBody<Bytes, HyperError>,
-    >,
-> = OnceLock::new();
+static HTTPS_CLIENT: OnceLock<UpstreamClient> = OnceLock::new();
+
+/// Apply the shared hyper client tuning used by every direct-connection variant.
+fn build_pooled_client(https: hyper_rustls::HttpsConnector<HttpConnector>) -> Box<DirectClient> {
+    Box::new(
+        Client::builder(TokioExecutor::new())
+            // Keep minimal pooling but with shorter timeouts
+            .pool_idle_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(1)
+            .http1_title_case_headers(false)
+            .http1_preserve_header_case(true)
+            .build(https),
+    )
+}
 
 /// Prepare a request for forwarding to upstream server
 /// Removes proxy-specific headers and converts body to BoxBody
@@ -250,45 +289,64 @@ fn create_client_config_with_ca(
         .with_no_client_auth()
 }
 
-/// Initialize the HTTP client with the httpjail CA certificate
-pub fn init_client_with_ca(ca_cert_der: rustls::pki_types::CertificateDer<'static>) {
+/// Build the direct (no upstream proxy) HTTPS connector: webpki roots plus the
+/// httpjail CA, with fast IPv6->IPv4 fallback (or the dangerous no-verification
+/// config for testing).
+fn build_direct_connector(
+    ca_cert_der: CertificateDer<'static>,
+    dangerous: bool,
+) -> hyper_rustls::HttpsConnector<HttpConnector> {
+    if dangerous {
+        let config = create_dangerous_client_config();
+        HttpsConnectorBuilder::new()
+            .with_tls_config(config)
+            .https_or_http()
+            .enable_http1()
+            .build()
+    } else {
+        let config = create_client_config_with_ca(ca_cert_der);
+        // Build an HttpConnector with fast IPv6->IPv4 fallback
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        http.set_happy_eyeballs_timeout(Some(Duration::from_millis(250)));
+        hyper_rustls::HttpsConnector::from((http, config))
+    }
+}
+
+/// Initialize the shared upstream client with the httpjail CA certificate and an
+/// optional upstream proxy. When a proxy is configured, all re-originated
+/// requests are routed through it; otherwise destinations are contacted directly.
+pub fn init_client_with_ca(
+    ca_cert_der: CertificateDer<'static>,
+    upstream_proxy: Option<UpstreamProxy>,
+) {
     HTTPS_CLIENT.get_or_init(|| {
         // Check if we should dangerously disable cert validation (TESTING ONLY!)
-        let https = if std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok() {
-            let config = create_dangerous_client_config();
+        let dangerous = std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok();
 
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_tls_config(config)
-                .https_or_http()
-                .enable_http1()
-                .build()
-        } else {
-            // Normal path - use webpki roots + httpjail CA
-            let config = create_client_config_with_ca(ca_cert_der);
-            // Build an HttpConnector with fast IPv6->IPv4 fallback
-            let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
-            http.enforce_http(false);
-            http.set_happy_eyeballs_timeout(Some(Duration::from_millis(250)));
-            let https = hyper_rustls::HttpsConnector::from((http, config));
-            info!("HTTPS connector initialized with webpki roots and httpjail CA");
-            https
-        };
-
-        Client::builder(TokioExecutor::new())
-            // Keep minimal pooling but with shorter timeouts
-            .pool_idle_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .http1_title_case_headers(false)
-            .http1_preserve_header_case(true)
-            .build(https)
+        match upstream_proxy {
+            None => {
+                let https = build_direct_connector(ca_cert_der, dangerous);
+                info!("HTTPS connector initialized with webpki roots and httpjail CA");
+                UpstreamClient::Direct(build_pooled_client(https))
+            }
+            Some(proxy) => {
+                // The destination/proxy TLS trusts the same roots as the direct
+                // client; the forwarder layers it on top of the CONNECT tunnel.
+                let tls_config = Arc::new(if dangerous {
+                    create_dangerous_client_config()
+                } else {
+                    create_client_config_with_ca(ca_cert_der)
+                });
+                info!("Upstream client initialized to route through the upstream proxy");
+                UpstreamClient::Proxied(ProxyForwarder::new(proxy, tls_config))
+            }
+        }
     });
 }
 
-/// Get or create the shared HTTP/HTTPS client
-pub fn get_client() -> &'static Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    BoxBody<Bytes, HyperError>,
-> {
+/// Get or create the shared upstream client
+pub fn get_client() -> &'static UpstreamClient {
     HTTPS_CLIENT.get_or_init(|| {
         // Fallback initialization if not already initialized with CA
         // This should not happen in normal operation
@@ -301,13 +359,7 @@ pub fn get_client() -> &'static Client<
             .enable_http1()
             .build();
 
-        Client::builder(TokioExecutor::new())
-            // Keep minimal pooling but with shorter timeouts
-            .pool_idle_timeout(Duration::from_secs(5))
-            .pool_max_idle_per_host(1)
-            .http1_title_case_headers(false)
-            .http1_preserve_header_case(true)
-            .build(https)
+        UpstreamClient::Direct(build_pooled_client(https))
     })
 }
 
@@ -401,11 +453,22 @@ impl ProxyServer {
         https_bind: Option<std::net::SocketAddr>,
         rule_engine: RuleEngine,
     ) -> Self {
+        Self::new_with_upstream_proxy(http_bind, https_bind, rule_engine, None)
+    }
+
+    /// Like [`ProxyServer::new`], but routes httpjail's own re-originated
+    /// requests through the given upstream (corporate) proxy when set.
+    pub fn new_with_upstream_proxy(
+        http_bind: Option<std::net::SocketAddr>,
+        https_bind: Option<std::net::SocketAddr>,
+        rule_engine: RuleEngine,
+        upstream_proxy: Option<UpstreamProxy>,
+    ) -> Self {
         let cert_manager = CertificateManager::new().expect("Failed to create certificate manager");
 
         // Initialize the HTTP client with our CA certificate
         let ca_cert_der = cert_manager.get_ca_cert_der();
-        init_client_with_ca(ca_cert_der);
+        init_client_with_ca(ca_cert_der, upstream_proxy);
 
         // Generate a unique nonce for loop detection (Issue #84)
         // Use 16 random hex characters for a reasonably short but collision-resistant ID
@@ -671,7 +734,7 @@ async fn proxy_request(
                 elapsed.as_millis(),
                 e
             );
-            return Err(e.into());
+            return Err(e);
         }
     };
 
