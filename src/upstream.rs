@@ -243,7 +243,10 @@ impl Service<Uri> for ProxyConnector {
             // Dial the proxy (TCP). The destination scheme is irrelevant here;
             // we always connect to the proxy's host:port.
             let proxy_uri: Uri = format!("http://{}:{}", proxy.host, proxy.port).parse()?;
-            let tcp = http.call(proxy_uri).await?.into_inner();
+            let tcp = match timeout(PROXY_SETUP_TIMEOUT, http.call(proxy_uri)).await {
+                Ok(result) => result?.into_inner(),
+                Err(_) => return Err(timed_out("connecting to upstream proxy")),
+            };
             let _ = tcp.set_nodelay(true);
 
             // Optionally negotiate TLS with the proxy itself.
