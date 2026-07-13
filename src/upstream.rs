@@ -85,6 +85,7 @@ impl UpstreamProxy {
         if spec.is_empty() {
             bail!("Upstream proxy specification is empty");
         }
+        let redacted_spec = redact_proxy_spec(spec);
 
         // Accept a bare `host:port` by assuming the http scheme.
         let (scheme, rest) = match spec.split_once("://") {
@@ -95,7 +96,11 @@ impl UpstreamProxy {
         let tls = match scheme.as_str() {
             "http" => false,
             "https" => true,
-            other => bail!("Unsupported upstream proxy scheme '{}': {}", other, spec),
+            other => bail!(
+                "Unsupported upstream proxy scheme '{}': {}",
+                other,
+                redacted_spec
+            ),
         };
 
         // Drop any path/query/fragment component; only the authority is used.
@@ -109,7 +114,7 @@ impl UpstreamProxy {
 
         let default_port = if tls { 443 } else { 80 };
         let (host, port) = parse_host_port(host_port, default_port)
-            .with_context(|| format!("Invalid upstream proxy authority: {}", spec))?;
+            .with_context(|| format!("Invalid upstream proxy authority: {}", redacted_spec))?;
 
         let auth = match userinfo {
             Some(userinfo) => Some(build_basic_auth(userinfo)?),
@@ -131,6 +136,22 @@ impl UpstreamProxy {
     pub fn http_auth(&self) -> Option<HeaderValue> {
         self.auth.clone()
     }
+}
+
+/// Redact userinfo from a proxy URL-like string before it is logged or included
+/// in an error message.
+pub fn redact_proxy_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    let (prefix, rest) = match spec.split_once("://") {
+        Some((scheme, rest)) => (format!("{scheme}://"), rest),
+        None => (String::new(), spec),
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, suffix) = rest.split_at(authority_end);
+    let Some((_, host_port)) = authority.rsplit_once('@') else {
+        return spec.to_string();
+    };
+    format!("{prefix}<redacted>@{host_port}{suffix}")
 }
 
 /// Split a `host:port` authority into its parts, handling bracketed IPv6
@@ -530,6 +551,22 @@ mod tests {
         assert_eq!(
             p.auth.unwrap().to_str().unwrap(),
             format!("Basic {}", base64_encode(b"user:p@ss:word"))
+        );
+    }
+
+    #[test]
+    fn redact_proxy_spec_removes_userinfo() {
+        assert_eq!(
+            redact_proxy_spec("http://user:secret@proxy.corp:3128/path"),
+            "http://<redacted>@proxy.corp:3128/path"
+        );
+        assert_eq!(
+            redact_proxy_spec("user:secret@proxy.corp:3128"),
+            "<redacted>@proxy.corp:3128"
+        );
+        assert_eq!(
+            redact_proxy_spec("http://proxy.corp:3128"),
+            "http://proxy.corp:3128"
         );
     }
 
