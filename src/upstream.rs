@@ -242,7 +242,8 @@ impl Service<Uri> for ProxyConnector {
         Box::pin(async move {
             // Dial the proxy (TCP). The destination scheme is irrelevant here;
             // we always connect to the proxy's host:port.
-            let proxy_uri: Uri = format!("http://{}:{}", proxy.host, proxy.port).parse()?;
+            let proxy_uri: Uri = format!("http://{}", host_port_authority(&proxy.host, proxy.port))
+                .parse()?;
             let tcp = match timeout(PROXY_SETUP_TIMEOUT, http.call(proxy_uri)).await {
                 Ok(result) => result?.into_inner(),
                 Err(_) => return Err(timed_out("connecting to upstream proxy")),
@@ -366,11 +367,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     // Bracket IPv6 literals in the request-target and Host header.
-    let target = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
+    let target = host_port_authority(host, port);
 
     let mut request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n");
     if let Some(value) = auth {
@@ -411,6 +408,16 @@ where
         host, port
     );
     Ok(())
+}
+
+/// Format a host and port for use as an HTTP authority, bracketing IPv6
+/// literals as required by URI syntax.
+fn host_port_authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 /// Read the proxy's `CONNECT` response up to the end of its headers and return
@@ -538,6 +545,12 @@ mod tests {
         let p = UpstreamProxy::parse("http://[::1]:3128").unwrap();
         assert_eq!(p.host, "::1");
         assert_eq!(p.port, 3128);
+    }
+
+    #[test]
+    fn host_port_authority_brackets_ipv6_literal() {
+        assert_eq!(host_port_authority("::1", 3128), "[::1]:3128");
+        assert_eq!(host_port_authority("proxy.corp", 3128), "proxy.corp:3128");
     }
 
     #[test]
