@@ -24,11 +24,13 @@
 //! (WebSocket, gRPC, ...) keep working.
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hyper::Uri;
 use hyper::header::HeaderValue;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::TokioIo;
+use percent_encoding::percent_decode_str;
 use rustls::pki_types::ServerName;
 use std::future::Future;
 use std::io;
@@ -188,8 +190,9 @@ fn build_basic_auth(userinfo: &str) -> Result<HeaderValue> {
         Some((user, pass)) => (user, pass),
         None => (userinfo, ""),
     };
-    let token =
-        base64_encode(format!("{}:{}", percent_decode(user), percent_decode(pass)).as_bytes());
+    let user = percent_decode_str(user).decode_utf8_lossy();
+    let pass = percent_decode_str(pass).decode_utf8_lossy();
+    let token = STANDARD.encode(format!("{user}:{pass}"));
     HeaderValue::from_str(&format!("Basic {}", token))
         .context("Invalid characters in upstream proxy credentials")
 }
@@ -454,67 +457,9 @@ where
         .ok_or_else(|| anyhow!("Malformed CONNECT status line: {:?}", first_line))
 }
 
-/// Minimal RFC 4648 base64 encoder (standard alphabet, with padding). Used only
-/// to build the `Proxy-Authorization: Basic ...` credential token, avoiding a
-/// dedicated base64 dependency.
-fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
-        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        out.push(ALPHABET[((triple >> 18) & 0x3f) as usize] as char);
-        out.push(ALPHABET[((triple >> 12) & 0x3f) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[((triple >> 6) & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[(triple & 0x3f) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
-/// Decode `%XX` percent-escapes in the userinfo portion of a proxy URL. Any
-/// malformed escape is left verbatim.
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let hi = (bytes[i + 1] as char).to_digit(16);
-            let lo = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(hi), Some(lo)) = (hi, lo) {
-                out.push((hi * 16 + lo) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_matches_known_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"user:pass"), "dXNlcjpwYXNz");
-    }
 
     #[test]
     fn parse_plain_proxy() {
@@ -566,7 +511,7 @@ mod tests {
         let p = UpstreamProxy::parse("http://user:p%40ss%3Aword@proxy.corp:3128").unwrap();
         assert_eq!(
             p.auth.unwrap().to_str().unwrap(),
-            format!("Basic {}", base64_encode(b"user:p@ss:word"))
+            "Basic dXNlcjpwQHNzOndvcmQ="
         );
     }
 
