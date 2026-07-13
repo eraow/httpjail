@@ -42,6 +42,7 @@ use tokio::time::{Duration, timeout};
 use tokio_rustls::TlsConnector;
 use tower_service::Service;
 use tracing::debug;
+use url::{Host, Url};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -88,14 +89,16 @@ impl UpstreamProxy {
             bail!("Upstream proxy specification is empty");
         }
         let redacted_spec = redact_proxy_spec(spec);
-
-        // Accept a bare `host:port` by assuming the http scheme.
-        let (scheme, rest) = match spec.split_once("://") {
-            Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
-            None => ("http".to_string(), spec),
+        let normalized = if spec.contains("://") {
+            spec.to_string()
+        } else {
+            format!("http://{spec}")
         };
 
-        let tls = match scheme.as_str() {
+        let url = Url::parse(&normalized)
+            .with_context(|| format!("Invalid upstream proxy URL: {}", redacted_spec))?;
+
+        let tls = match url.scheme() {
             "http" => false,
             "https" => true,
             other => bail!(
@@ -105,22 +108,21 @@ impl UpstreamProxy {
             ),
         };
 
-        // Drop any path/query/fragment component; only the authority is used.
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-
-        // Split optional `userinfo@` from the `host:port` authority.
-        let (userinfo, host_port) = match authority.rsplit_once('@') {
-            Some((userinfo, host_port)) => (Some(userinfo), host_port),
-            None => (None, authority),
+        let host = match url.host() {
+            Some(Host::Domain(host)) => host.to_string(),
+            Some(Host::Ipv4(host)) => host.to_string(),
+            Some(Host::Ipv6(host)) => host.to_string(),
+            None => bail!("Invalid upstream proxy authority: {}", redacted_spec),
         };
 
-        let default_port = if tls { 443 } else { 80 };
-        let (host, port) = parse_host_port(host_port, default_port)
-            .with_context(|| format!("Invalid upstream proxy authority: {}", redacted_spec))?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| anyhow!("Invalid upstream proxy authority: {}", redacted_spec))?;
 
-        let auth = match userinfo {
-            Some(userinfo) => Some(build_basic_auth(userinfo)?),
-            None => None,
+        let auth = if !url.username().is_empty() || url.password().is_some() {
+            Some(build_basic_auth(url.username(), url.password())?)
+        } else {
+            None
         };
 
         Ok(UpstreamProxy {
@@ -156,42 +158,11 @@ pub fn redact_proxy_spec(spec: &str) -> String {
     format!("{prefix}<redacted>@{host_port}{suffix}")
 }
 
-/// Split a `host:port` authority into its parts, handling bracketed IPv6
-/// literals (`[::1]:3128`). Falls back to `default_port` when no port is given.
-fn parse_host_port(authority: &str, default_port: u16) -> Result<(String, u16)> {
-    if let Some(rest) = authority.strip_prefix('[') {
-        // Bracketed IPv6 literal: `[addr]` or `[addr]:port`.
-        let (addr, after) = rest
-            .split_once(']')
-            .ok_or_else(|| anyhow!("unterminated IPv6 literal: {}", authority))?;
-        let port = match after.strip_prefix(':') {
-            Some(port) => port.parse().context("invalid port")?,
-            None if after.is_empty() => default_port,
-            None => bail!("unexpected characters after IPv6 literal: {}", authority),
-        };
-        return Ok((addr.to_string(), port));
-    }
-
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse().context("invalid port")?),
-        None => (authority, default_port),
-    };
-
-    if host.is_empty() {
-        bail!("missing host: {}", authority);
-    }
-    Ok((host.to_string(), port))
-}
-
 /// Build a `Proxy-Authorization: Basic ...` header value from `user:pass`
 /// userinfo, percent-decoding each component first.
-fn build_basic_auth(userinfo: &str) -> Result<HeaderValue> {
-    let (user, pass) = match userinfo.split_once(':') {
-        Some((user, pass)) => (user, pass),
-        None => (userinfo, ""),
-    };
+fn build_basic_auth(user: &str, pass: Option<&str>) -> Result<HeaderValue> {
     let user = percent_decode_str(user).decode_utf8_lossy();
-    let pass = percent_decode_str(pass).decode_utf8_lossy();
+    let pass = percent_decode_str(pass.unwrap_or("")).decode_utf8_lossy();
     let token = STANDARD.encode(format!("{user}:{pass}"));
     HeaderValue::from_str(&format!("Basic {}", token))
         .context("Invalid characters in upstream proxy credentials")
@@ -468,6 +439,14 @@ mod tests {
         assert_eq!(p.port, 3128);
         assert!(!p.tls);
         assert!(p.auth.is_none());
+    }
+
+    #[test]
+    fn parse_proxy_ignores_path_query_and_fragment() {
+        let p = UpstreamProxy::parse("http://proxy.corp:3128/path?ignored=true#frag").unwrap();
+        assert_eq!(p.host, "proxy.corp");
+        assert_eq!(p.port, 3128);
+        assert!(!p.tls);
     }
 
     #[test]
