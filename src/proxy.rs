@@ -3,12 +3,12 @@ use crate::dangerous_verifier::create_dangerous_client_config;
 use crate::rules::{Action, RuleEngine};
 #[allow(unused_imports)]
 use crate::tls::CertificateManager;
-use crate::upstream::{ProxyConnector, UpstreamProxy};
+use crate::upstream::{ProxyConnector, UpstreamProxies};
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
+use hyper::header::PROXY_AUTHORIZATION;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Error as HyperError, Request, Response, StatusCode, Uri};
@@ -176,9 +176,7 @@ pub enum UpstreamClient {
     Direct(DirectClient),
     Proxied {
         client: ProxiedClient,
-        /// Attached to plain-HTTP requests forwarded through the proxy in
-        /// absolute-form (HTTPS carries credentials on the CONNECT instead).
-        http_auth: Option<HeaderValue>,
+        proxies: UpstreamProxies,
     },
 }
 
@@ -191,9 +189,9 @@ impl UpstreamClient {
     ) -> Result<Response<Incoming>> {
         match self {
             UpstreamClient::Direct(client) => client.request(req).await.map_err(Into::into),
-            UpstreamClient::Proxied { client, http_auth } => {
+            UpstreamClient::Proxied { client, proxies } => {
                 if req.uri().scheme_str() == Some("http")
-                    && let Some(auth) = http_auth
+                    && let Some(auth) = proxies.http_auth()
                 {
                     req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
                 }
@@ -336,23 +334,24 @@ fn build_direct_connector(
 }
 
 /// Initialize the shared upstream client with the httpjail CA certificate and an
-/// optional upstream proxy. When a proxy is configured, all re-originated
-/// requests are routed through it; otherwise destinations are contacted directly.
+/// optional upstream proxies. When a proxy is configured for a destination
+/// scheme, matching re-originated requests are routed through it; otherwise
+/// destinations are contacted directly.
 pub fn init_client_with_ca(
     ca_cert_der: CertificateDer<'static>,
-    upstream_proxy: Option<UpstreamProxy>,
+    upstream_proxies: Option<UpstreamProxies>,
 ) {
     HTTPS_CLIENT.get_or_init(|| {
         // Check if we should dangerously disable cert validation (TESTING ONLY!)
         let dangerous = std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok();
 
-        match upstream_proxy {
+        match upstream_proxies {
             None => {
                 let https = build_direct_connector(ca_cert_der, dangerous);
-                info!("HTTPS connector initialized with webpki roots and httpjail CA");
+                debug!("HTTPS connector initialized with webpki roots and httpjail CA");
                 UpstreamClient::Direct(build_pooled_client(https))
             }
-            Some(proxy) => {
+            Some(proxies) => {
                 // Both the destination TLS (layered over the CONNECT tunnel by
                 // the HttpsConnector) and the optional https:// proxy TLS trust
                 // the same roots as the direct client.
@@ -363,13 +362,13 @@ pub fn init_client_with_ca(
                         create_client_config_with_ca(ca_cert_der.clone())
                     }
                 };
-                let http_auth = proxy.http_auth();
-                let connector = ProxyConnector::new(proxy, Arc::new(make_config()));
+                let connector =
+                    ProxyConnector::with_config(proxies.clone(), Arc::new(make_config()));
                 let https = hyper_rustls::HttpsConnector::from((connector, make_config()));
-                info!("Upstream client initialized to route through the upstream proxy");
+                debug!("Upstream client initialized to route through the upstream proxy");
                 UpstreamClient::Proxied {
                     client: build_pooled_client(https),
-                    http_auth,
+                    proxies,
                 }
             }
         }
@@ -484,22 +483,22 @@ impl ProxyServer {
         https_bind: Option<std::net::SocketAddr>,
         rule_engine: RuleEngine,
     ) -> Self {
-        Self::new_with_upstream_proxy(http_bind, https_bind, rule_engine, None)
+        Self::new_with_upstream_proxies(http_bind, https_bind, rule_engine, None)
     }
 
     /// Like [`ProxyServer::new`], but routes httpjail's own re-originated
-    /// requests through the given upstream (corporate) proxy when set.
-    pub fn new_with_upstream_proxy(
+    /// requests through the configured upstream proxies when set.
+    pub fn new_with_upstream_proxies(
         http_bind: Option<std::net::SocketAddr>,
         https_bind: Option<std::net::SocketAddr>,
         rule_engine: RuleEngine,
-        upstream_proxy: Option<UpstreamProxy>,
+        upstream_proxies: Option<UpstreamProxies>,
     ) -> Self {
         let cert_manager = CertificateManager::new().expect("Failed to create certificate manager");
 
         // Initialize the HTTP client with our CA certificate
         let ca_cert_der = cert_manager.get_ca_cert_der();
-        init_client_with_ca(ca_cert_der, upstream_proxy);
+        init_client_with_ca(ca_cert_der, upstream_proxies);
 
         // Generate a unique nonce for loop detection (Issue #84)
         // Use 16 random hex characters for a reasonably short but collision-resistant ID
@@ -875,14 +874,15 @@ mod tests {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let proxy = UpstreamProxy::parse(&format!("http://user:pass@{}", addr)).unwrap();
-        let http_auth = proxy.http_auth();
+        let proxy =
+            crate::upstream::UpstreamProxy::parse(&format!("http://user:pass@{}", addr)).unwrap();
+        let proxies = UpstreamProxies::all(proxy.clone());
         let connector = ProxyConnector::new(proxy, Arc::new(create_dangerous_client_config()));
         let https =
             hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
         let client = UpstreamClient::Proxied {
             client: build_pooled_client(https),
-            http_auth,
+            proxies,
         };
 
         let body = Empty::<Bytes>::new()

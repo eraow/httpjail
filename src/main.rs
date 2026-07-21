@@ -86,13 +86,6 @@ struct RunArgs {
     #[arg(long = "request-log", value_name = "FILE")]
     request_log: Option<String>,
 
-    /// Route httpjail's own upstream requests through an upstream (corporate) proxy.
-    /// Accepts http://host:port, https://host:port, or host:port (http assumed),
-    /// optionally with credentials: http://user:pass@host:port.
-    /// Falls back to the HTTPJAIL_UPSTREAM_PROXY environment variable.
-    #[arg(long = "upstream-proxy", value_name = "URL")]
-    upstream_proxy: Option<String>,
-
     /// Use weak mode (environment variables only, no system isolation)
     #[arg(long = "weak")]
     weak: bool,
@@ -149,17 +142,12 @@ struct RunArgs {
 
 impl fmt::Debug for RunArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let upstream_proxy = self
-            .upstream_proxy
-            .as_deref()
-            .map(httpjail::upstream::redact_proxy_spec);
         f.debug_struct("RunArgs")
             .field("sh", &self.sh)
             .field("proc", &self.proc)
             .field("js", &self.js)
             .field("js_file", &self.js_file)
             .field("request_log", &self.request_log)
-            .field("upstream_proxy", &upstream_proxy)
             .field("weak", &self.weak)
             .field("verbose", &self.verbose)
             .field("timeout", &self.timeout)
@@ -624,27 +612,18 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Resolve the optional upstream (corporate) proxy from the flag or env var.
-    // This is independent of the HTTP_PROXY/HTTPS_PROXY variables httpjail sets
-    // *inside* the jail to point sandboxed processes at itself.
-    let upstream_proxy_spec = args
-        .run_args
-        .upstream_proxy
-        .clone()
-        .or_else(|| std::env::var("HTTPJAIL_UPSTREAM_PROXY").ok());
-    let upstream_proxy = match upstream_proxy_spec {
-        Some(spec) => {
-            let proxy = httpjail::upstream::UpstreamProxy::parse(&spec)
-                .with_context(|| format!("Failed to parse upstream proxy: {}", spec))?;
-            // Avoid logging the spec verbatim as it may contain credentials.
-            info!("Routing httpjail upstream requests through the configured upstream proxy");
-            Some(proxy)
-        }
-        None => None,
-    };
+    let upstream_proxies = httpjail::upstream::UpstreamProxies::from_env()
+        .context("Failed to configure upstream proxy from environment")?;
+    if upstream_proxies.is_some() {
+        debug!("Routing httpjail upstream requests through the proxy environment");
+    }
 
-    let mut proxy =
-        ProxyServer::new_with_upstream_proxy(http_bind, https_bind, rule_engine, upstream_proxy);
+    let mut proxy = ProxyServer::new_with_upstream_proxies(
+        http_bind,
+        https_bind,
+        rule_engine,
+        upstream_proxies,
+    );
 
     // Start proxy in background if running as server; otherwise start with random ports
     let (actual_http_port, actual_https_port) = proxy.start().await?;

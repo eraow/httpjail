@@ -7,7 +7,7 @@ httpjail's behavior can be configured through command-line options, environment 
 httpjail follows a simple configuration hierarchy:
 
 1. **Command-line options** - Highest priority, override everything
-2. **Environment variables** - Set by httpjail for the jailed process
+2. **Environment variables** - Configure httpjail and the jailed process
 
 ## Key Configuration Areas
 
@@ -72,9 +72,11 @@ httpjail --proc ./rate-limiter.py \
 
 ## Environment Variables
 
-### Set by httpjail
+### Set for the jailed process
 
-These are automatically set in the jailed process:
+These are set in the jailed process where applicable. In weak mode, httpjail
+sets proxy variables so applications talk to httpjail. On Linux strong mode,
+traffic is redirected transparently without setting proxy variables.
 
 | Variable        | Description                  | Example                  |
 | --------------- | ---------------------------- | ------------------------ |
@@ -84,7 +86,7 @@ These are automatically set in the jailed process:
 | `SSL_CERT_DIR`  | CA certificate directory     | `/tmp/httpjail-certs/`   |
 | `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1`    |
 
-### Controlling httpjail
+### Consumed by httpjail
 
 These affect httpjail's behavior:
 
@@ -92,11 +94,10 @@ These affect httpjail's behavior:
 | ------------------------ | -------------------------------------- | -------------------------------- |
 | `RUST_LOG`               | Logging level                          | `debug`, `info`, `warn`, `error` |
 | `HTTPJAIL_CA_CERT`       | Custom CA certificate path             | `/etc/pki/custom-ca.pem`         |
-| `HTTPJAIL_UPSTREAM_PROXY`| Upstream proxy for httpjail's egress   | `http://proxy.corp:3128`         |
+| `HTTP_PROXY`             | Upstream proxy for httpjail HTTP egress | `http://proxy.corp:3128`        |
+| `HTTPS_PROXY`            | Upstream proxy for httpjail HTTPS egress | `http://proxy.corp:3128`       |
 
-The `--upstream-proxy` command-line flag takes precedence over
-`HTTPJAIL_UPSTREAM_PROXY`. See [Upstream Proxy](../advanced/upstream-proxy.md)
-for details.
+See [Upstream Proxy](../advanced/upstream-proxy.md) for details.
 
 ## Platform-Specific Configuration
 
