@@ -65,7 +65,7 @@ httpjail --js "r.host === 'api.github.com'" --docker-run -- --rm alpine:latest w
 
 # Route httpjail's own egress through an upstream (corporate) proxy
 HTTPS_PROXY=http://proxy.corp:3128 httpjail --js "true" -- curl https://api.github.com
-# Credentials and HTTPS proxies are supported: http://user:pass@proxy.corp:3128, https://proxy.corp:8443
+# Basic authentication is supported: http://user:pass@proxy.corp:3128
 ```
 
 ### Upstream (corporate) proxy
@@ -76,7 +76,8 @@ outbound requests through an upstream proxy. Rule evaluation still happens
 locally on the intercepted traffic; only the re-originated request is forwarded
 through the proxy.
 
-- `http://`, `https://` and bare `host:port` (http assumed) forms are accepted.
+- `http://host:port` and bare `host:port` (http assumed) forms are accepted.
+  Reaching the proxy itself over TLS (`https://proxy`) is not supported.
 - Basic authentication is supported via `http://user:pass@host:port`.
 - HTTPS destinations are reached via a `CONNECT` tunnel through the proxy, while
   plain HTTP destinations are forwarded in absolute-form.

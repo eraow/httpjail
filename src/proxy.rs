@@ -352,19 +352,15 @@ pub fn init_client_with_ca(
                 UpstreamClient::Direct(build_pooled_client(https))
             }
             Some(proxies) => {
-                // Both the destination TLS (layered over the CONNECT tunnel by
-                // the HttpsConnector) and the optional https:// proxy TLS trust
-                // the same roots as the direct client.
-                let make_config = || {
-                    if dangerous {
-                        create_dangerous_client_config()
-                    } else {
-                        create_client_config_with_ca(ca_cert_der.clone())
-                    }
+                // The destination TLS, layered over the CONNECT tunnel by the
+                // HttpsConnector, trusts the same roots as the direct client.
+                let config = if dangerous {
+                    create_dangerous_client_config()
+                } else {
+                    create_client_config_with_ca(ca_cert_der)
                 };
-                let connector =
-                    ProxyConnector::with_config(proxies.clone(), Arc::new(make_config()));
-                let https = hyper_rustls::HttpsConnector::from((connector, make_config()));
+                let connector = ProxyConnector::with_config(proxies.clone());
+                let https = hyper_rustls::HttpsConnector::from((connector, config));
                 debug!("Upstream client initialized to route through the upstream proxy");
                 UpstreamClient::Proxied {
                     client: build_pooled_client(https),
@@ -877,7 +873,7 @@ mod tests {
         let proxy =
             crate::upstream::UpstreamProxy::parse(&format!("http://user:pass@{}", addr)).unwrap();
         let proxies = UpstreamProxies::all(proxy.clone());
-        let connector = ProxyConnector::new(proxy, Arc::new(create_dangerous_client_config()));
+        let connector = ProxyConnector::new(proxy);
         let https =
             hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
         let client = UpstreamClient::Proxied {

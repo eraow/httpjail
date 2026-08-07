@@ -19,9 +19,6 @@ HTTP_PROXY=http://proxy.corp:3128 HTTPS_PROXY=http://proxy.corp:3128 \
 
 # With Basic authentication
 HTTPS_PROXY=http://user:pass@proxy.corp:3128 httpjail --js "true" -- ./my-app
-
-# Through an HTTPS proxy
-HTTPS_PROXY=https://proxy.corp:8443 httpjail --js "true" -- ./my-app
 ```
 
 ## Accepted formats
@@ -29,12 +26,17 @@ HTTPS_PROXY=https://proxy.corp:8443 httpjail --js "true" -- ./my-app
 | Form | Example | Notes |
 | --- | --- | --- |
 | `http://host:port` | `http://proxy.corp:3128` | Plain HTTP proxy |
-| `https://host:port` | `https://proxy.corp:8443` | Connection to the proxy is wrapped in TLS |
 | `host:port` | `proxy.corp:3128` | Bare authority, `http` scheme assumed |
 | With credentials | `http://user:pass@proxy.corp:3128` | Sends `Proxy-Authorization: Basic ...` |
 
 `HTTP_PROXY` is used for `http://` destinations. `HTTPS_PROXY` is used for
 `https://` destinations. Credentials are never written to the logs.
+
+Note that the value describes how httpjail reaches the proxy, not the scheme of
+the destinations it covers: `HTTPS_PROXY=http://proxy.corp:3128` is the normal
+configuration and sends HTTPS destinations through a plain HTTP proxy. Reaching
+the proxy itself over TLS (an `https://` proxy URL) is not supported and is
+rejected with an error.
 
 ## How it works
 
@@ -44,9 +46,9 @@ HTTPS_PROXY=https://proxy.corp:8443 httpjail --js "true" -- ./my-app
   plus the httpjail CA, exactly as for a direct connection.
 - **Plain HTTP destinations** are forwarded to the proxy in absolute-form, with
   the `Proxy-Authorization` header attached when credentials are configured.
-- Only connection setup (TCP connect, optional TLS to the proxy, and the
-  `CONNECT` exchange) is bounded by a timeout. The established tunnel carries no
-  timeout, so long-running connections such as WebSocket and gRPC keep working.
+- Only connection setup (the TCP connect and the `CONNECT` exchange) is bounded
+  by a timeout. The established tunnel carries no timeout, so long-running
+  connections such as WebSocket and gRPC keep working.
 
 ## Relationship to jailed process proxy variables
 
