@@ -84,7 +84,13 @@ traffic is redirected transparently without setting proxy variables.
 | `HTTPS_PROXY`   | HTTPS proxy address          | `http://127.0.0.1:34567` |
 | `SSL_CERT_FILE` | CA certificate path          | `/tmp/httpjail-ca.pem`   |
 | `SSL_CERT_DIR`  | CA certificate directory     | `/tmp/httpjail-certs/`   |
-| `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1`    |
+| `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1,::1` |
+
+The parent's proxy variables are never inherited by the jailed process:
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are removed (in both spellings) so
+the process cannot reach the upstream proxy directly or read its credentials, and
+`NO_PROXY` is set to the local addresses only rather than merged with the
+parent's value, which would let the process bypass httpjail.
 
 ### Consumed by httpjail
 

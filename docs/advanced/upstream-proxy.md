@@ -110,3 +110,10 @@ point sandboxed processes at httpjail itself.
 
 The jailed process talks to httpjail; the proxy env vars only affect the hop
 from httpjail to the outside world.
+
+None of the parent's proxy variables are passed on to the jailed process, in any
+mode. `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are removed so the process
+cannot reach the upstream proxy directly or read its credentials, and `NO_PROXY`
+is replaced with the local addresses only. Inheriting `NO_PROXY` would let the
+process connect straight to every destination it named, with no rule evaluation
+at all. In weak mode httpjail then sets the proxy variables to its own address.
