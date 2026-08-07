@@ -7,7 +7,6 @@ use httpjail::rules::shell::ShellRuleEngine;
 use httpjail::rules::v8_js::V8JsRuleEngine;
 use httpjail::rules::{Action, RuleEngine};
 use hyper::Method;
-use std::fmt;
 use std::fs::OpenOptions;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,7 +40,7 @@ enum Command {
     },
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 struct RunArgs {
     /// Use shell script for evaluating requests
     /// The script receives environment variables:
@@ -138,27 +137,6 @@ struct RunArgs {
     /// Command and arguments to execute  
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     exec_command: Vec<String>,
-}
-
-impl fmt::Debug for RunArgs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RunArgs")
-            .field("sh", &self.sh)
-            .field("proc", &self.proc)
-            .field("js", &self.js)
-            .field("js_file", &self.js_file)
-            .field("request_log", &self.request_log)
-            .field("weak", &self.weak)
-            .field("verbose", &self.verbose)
-            .field("timeout", &self.timeout)
-            .field("no_jail_cleanup", &self.no_jail_cleanup)
-            .field("cleanup", &self.cleanup)
-            .field("server", &self.server)
-            .field("test", &self.test)
-            .field("docker_run", &self.docker_run)
-            .field("exec_command", &self.exec_command)
-            .finish()
-    }
 }
 
 fn setup_logging(verbosity: u8) {
