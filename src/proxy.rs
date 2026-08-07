@@ -29,7 +29,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 #[cfg(target_os = "linux")]
 use std::net::Ipv6Addr;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
@@ -181,6 +181,45 @@ pub enum UpstreamClient {
 }
 
 impl UpstreamClient {
+    /// Build the upstream client for one [`ProxyServer`]: either contacting
+    /// destinations directly, or routing every re-originated request whose
+    /// scheme has a configured proxy through that proxy.
+    ///
+    /// Each `ProxyServer` owns its own client, so the upstream configuration is
+    /// exactly what the caller asked for rather than whatever the first
+    /// initialization in the process happened to install.
+    pub fn new(
+        ca_cert_der: CertificateDer<'static>,
+        upstream_proxies: Option<UpstreamProxies>,
+    ) -> Self {
+        // Check if we should dangerously disable cert validation (TESTING ONLY!)
+        let dangerous = std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok();
+
+        match upstream_proxies {
+            None => {
+                let https = build_direct_connector(ca_cert_der, dangerous);
+                debug!("HTTPS connector initialized with webpki roots and httpjail CA");
+                UpstreamClient::Direct(build_pooled_client(https))
+            }
+            Some(proxies) => {
+                // The destination TLS, layered over the CONNECT tunnel by the
+                // HttpsConnector, trusts the same roots as the direct client.
+                let config = if dangerous {
+                    create_dangerous_client_config()
+                } else {
+                    create_client_config_with_ca(ca_cert_der)
+                };
+                let connector = ProxyConnector::with_config(proxies.clone());
+                let https = hyper_rustls::HttpsConnector::from((connector, config));
+                debug!("Upstream client initialized to route through the upstream proxy");
+                UpstreamClient::Proxied {
+                    client: build_pooled_client(https),
+                    proxies,
+                }
+            }
+        }
+    }
+
     /// Forward a prepared request upstream. No timeout is applied here so that
     /// long-running connections (WebSocket, gRPC, ...) keep working.
     pub async fn request(
@@ -200,9 +239,6 @@ impl UpstreamClient {
         }
     }
 }
-
-// Shared HTTP/HTTPS client for upstream requests
-static HTTPS_CLIENT: OnceLock<UpstreamClient> = OnceLock::new();
 
 /// Build a pooled hyper client over the given connector with the shared tuning.
 fn build_pooled_client<C>(connector: C) -> Client<C, BoxBody<Bytes, HyperError>>
@@ -333,62 +369,6 @@ fn build_direct_connector(
     }
 }
 
-/// Initialize the shared upstream client with the httpjail CA certificate and an
-/// optional upstream proxies. When a proxy is configured for a destination
-/// scheme, matching re-originated requests are routed through it; otherwise
-/// destinations are contacted directly.
-pub fn init_client_with_ca(
-    ca_cert_der: CertificateDer<'static>,
-    upstream_proxies: Option<UpstreamProxies>,
-) {
-    HTTPS_CLIENT.get_or_init(|| {
-        // Check if we should dangerously disable cert validation (TESTING ONLY!)
-        let dangerous = std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok();
-
-        match upstream_proxies {
-            None => {
-                let https = build_direct_connector(ca_cert_der, dangerous);
-                debug!("HTTPS connector initialized with webpki roots and httpjail CA");
-                UpstreamClient::Direct(build_pooled_client(https))
-            }
-            Some(proxies) => {
-                // The destination TLS, layered over the CONNECT tunnel by the
-                // HttpsConnector, trusts the same roots as the direct client.
-                let config = if dangerous {
-                    create_dangerous_client_config()
-                } else {
-                    create_client_config_with_ca(ca_cert_der)
-                };
-                let connector = ProxyConnector::with_config(proxies.clone());
-                let https = hyper_rustls::HttpsConnector::from((connector, config));
-                debug!("Upstream client initialized to route through the upstream proxy");
-                UpstreamClient::Proxied {
-                    client: build_pooled_client(https),
-                    proxies,
-                }
-            }
-        }
-    });
-}
-
-/// Get or create the shared upstream client
-pub fn get_client() -> &'static UpstreamClient {
-    HTTPS_CLIENT.get_or_init(|| {
-        // Fallback initialization if not already initialized with CA
-        // This should not happen in normal operation
-        warn!("HTTP client accessed before CA initialization, using native roots only");
-
-        let https = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .expect("Failed to load native roots")
-            .https_or_http()
-            .enable_http1()
-            .build();
-
-        UpstreamClient::Direct(build_pooled_client(https))
-    })
-}
-
 /// Try to bind to an available port in the given range (up to 16 attempts)
 async fn bind_to_available_port(start: u16, end: u16, ip: std::net::IpAddr) -> Result<TcpListener> {
     let mut rng = rand::thread_rng();
@@ -463,6 +443,9 @@ async fn bind_listener(addr: std::net::SocketAddr) -> Result<TcpListener> {
 pub struct ProxyContext {
     pub rule_engine: Arc<RuleEngine>,
     pub cert_manager: Arc<CertificateManager>,
+    /// Client used to re-originate allowed requests towards the real
+    /// destination, either directly or through an upstream proxy.
+    pub upstream_client: Arc<UpstreamClient>,
     /// Unique nonce for this proxy instance, used for loop detection (Issue #84)
     pub loop_nonce: Arc<String>,
 }
@@ -492,9 +475,8 @@ impl ProxyServer {
     ) -> Self {
         let cert_manager = CertificateManager::new().expect("Failed to create certificate manager");
 
-        // Initialize the HTTP client with our CA certificate
-        let ca_cert_der = cert_manager.get_ca_cert_der();
-        init_client_with_ca(ca_cert_der, upstream_proxies);
+        // Build this server's upstream client, trusting our own CA
+        let upstream_client = UpstreamClient::new(cert_manager.get_ca_cert_der(), upstream_proxies);
 
         // Generate a unique nonce for loop detection (Issue #84)
         // Use 16 random hex characters for a reasonably short but collision-resistant ID
@@ -506,6 +488,7 @@ impl ProxyServer {
         let context = ProxyContext {
             rule_engine: Arc::new(rule_engine),
             cert_manager: Arc::new(cert_manager),
+            upstream_client: Arc::new(upstream_client),
             loop_nonce: Arc::new(loop_nonce),
         };
 
@@ -684,7 +667,14 @@ pub async fn handle_http_request(
                 "Request allowed: {} (max_tx_bytes: {:?})",
                 full_url, evaluation.max_tx_bytes
             );
-            match proxy_request(req, &full_url, evaluation.max_tx_bytes, &context.loop_nonce).await
+            match proxy_request(
+                req,
+                &full_url,
+                evaluation.max_tx_bytes,
+                &context.loop_nonce,
+                &context.upstream_client,
+            )
+            .await
             {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
@@ -705,6 +695,7 @@ async fn proxy_request(
     full_url: &str,
     max_tx_bytes: Option<u64>,
     loop_nonce: &str,
+    client: &UpstreamClient,
 ) -> Result<Response<BoxBody<Bytes, HyperError>>> {
     // Parse the target URL
     let target_uri = full_url.parse::<Uri>()?;
@@ -736,9 +727,6 @@ async fn proxy_request(
         let (parts, body) = prepared_req.into_parts();
         Request::from_parts(parts, body.boxed())
     };
-
-    // Use the shared HTTP/HTTPS client
-    let client = get_client();
 
     // Forward the request - no timeout to support long-running connections
     debug!("Sending HTTP request to upstream server: {}", full_url);
@@ -840,6 +828,33 @@ mod tests {
         assert!((8000..=8999).contains(&http_port));
         assert!((8000..=8999).contains(&https_port));
         assert_ne!(http_port, https_port);
+    }
+
+    /// Each server must honor the upstream configuration it was constructed
+    /// with. Before the client moved onto ProxyContext, whichever server ran
+    /// first installed a process-global client and the second silently inherited
+    /// it, so a proxied server created after a direct one lost its proxy.
+    #[tokio::test]
+    async fn upstream_client_is_per_server() {
+        let rule_engine = || {
+            let engine = V8JsRuleEngine::new("true".to_string()).unwrap();
+            RuleEngine::from_trait(Box::new(engine), None)
+        };
+
+        let direct = ProxyServer::new(None, None, rule_engine());
+        let proxies =
+            UpstreamProxies::all(crate::upstream::UpstreamProxy::parse("proxy:3128").unwrap());
+        let proxied =
+            ProxyServer::new_with_upstream_proxies(None, None, rule_engine(), Some(proxies));
+
+        assert!(matches!(
+            direct.context.upstream_client.as_ref(),
+            UpstreamClient::Direct(_)
+        ));
+        assert!(matches!(
+            proxied.context.upstream_client.as_ref(),
+            UpstreamClient::Proxied { .. }
+        ));
     }
 
     /// A plain-HTTP request routed through an upstream proxy must be forwarded in
