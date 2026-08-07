@@ -294,7 +294,7 @@ impl Service<Uri> for ProxyConnector {
             let _ = stream.set_nodelay(true);
 
             let proxied = if dst.scheme_str() == Some("https") {
-                let host = dst.host().ok_or_else(|| {
+                let host = uri_host(&dst).ok_or_else(|| {
                     BoxError::from(format!("CONNECT target has no host: {}", dst))
                 })?;
                 let port = dst.port_u16().unwrap_or(443);
@@ -438,8 +438,23 @@ where
     Ok(())
 }
 
+/// The destination host as a bare host name or IP literal.
+///
+/// [`Uri::host`] keeps the square brackets that URI syntax requires around an
+/// IPv6 literal (`https://[::1]/` yields `[::1]`), so the brackets are stripped
+/// here to obtain the host itself. [`host_port_authority`] adds them back when
+/// the host is used in an authority position.
+fn uri_host(uri: &Uri) -> Option<&str> {
+    uri.host().map(|host| {
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host)
+    })
+}
+
 /// Format a host and port for use as an HTTP authority, bracketing IPv6
-/// literals as required by URI syntax.
+/// literals as required by URI syntax. `host` must be a bare host (see
+/// [`uri_host`]); an already-bracketed literal would be bracketed twice.
 fn host_port_authority(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -647,20 +662,32 @@ mod tests {
         assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
     }
 
+    /// An IPv6 literal destination must reach the proxy as `[::1]:443`, taking
+    /// the host from the destination `Uri` exactly as the connector does.
+    /// `Uri::host()` returns the literal already bracketed, so feeding it
+    /// straight into the authority would produce `[[::1]]:443`.
     #[tokio::test]
-    async fn connect_tunnel_brackets_ipv6_literal() {
+    async fn connect_tunnel_brackets_ipv6_literal_from_uri() {
         let (mut client_end, proxy_end) = tokio::io::duplex(1024);
         let proxy = tokio::spawn(fake_proxy(
             proxy_end,
             b"HTTP/1.1 200 Connection established\r\n\r\n",
         ));
 
-        establish_connect_tunnel(&mut client_end, "::1", 443, None)
+        let dst: Uri = "https://[::1]/".parse().unwrap();
+        let host = uri_host(&dst).unwrap();
+        assert_eq!(host, "::1");
+
+        establish_connect_tunnel(&mut client_end, host, dst.port_u16().unwrap_or(443), None)
             .await
             .unwrap();
 
         let request = proxy.await.unwrap();
-        assert!(request.starts_with("CONNECT [::1]:443 HTTP/1.1\r\n"));
+        assert!(
+            request.starts_with("CONNECT [::1]:443 HTTP/1.1\r\n"),
+            "unexpected request: {request}"
+        );
+        assert!(request.contains("Host: [::1]:443\r\n"));
     }
 
     #[tokio::test]
