@@ -38,6 +38,52 @@ configuration and sends HTTPS destinations through a plain HTTP proxy. Reaching
 the proxy itself over TLS (an `https://` proxy URL) is not supported and is
 rejected with an error.
 
+## Bypassing the proxy with `NO_PROXY`
+
+`NO_PROXY` lists destinations that httpjail contacts directly instead of through
+the upstream proxy. The syntax follows curl 8.14.1.
+
+| Form | Example | Notes |
+| --- | --- | --- |
+| Domain | `example.com` | Matches the domain and its subdomains, not `notexample.com` |
+| Leading dot | `.example.com` | One leading dot is ignored; same as above |
+| Wildcard | `*` | Only when the whole list is exactly `*`: no proxy is used at all |
+| IPv4 CIDR | `192.168.0.0/16` | Only for destinations written as an IP literal |
+| IPv6 CIDR | `2001:db8::/32` | Only for destinations written as an IP literal |
+| Address | `192.168.1.1` | Without a prefix length, an exact address match |
+
+Entries are separated by commas, matched case-insensitively, and one trailing dot
+is ignored on both the entry and the destination. Rule evaluation is unaffected:
+a bypassed request is still checked against your rules, it just reaches the
+destination directly.
+
+Not supported:
+
+- **Ports in entries.** `example.com:8080` matches nothing, because entries are
+  compared against the destination's host name only. It does not fall back to
+  matching `example.com`.
+- **Globs, schemes and paths.** `*.example.com` and `https://example.com` match
+  nothing. Use `example.com`, which already covers subdomains.
+- **Matching resolved addresses.** A CIDR entry applies only when the destination
+  itself is an IP literal; host names are never resolved to check them.
+
+A mistyped CIDR (`10.0.0.0/8x`, `10.0.0.0/33`) is reported as a configuration
+error at startup rather than silently ignored. Entries that simply cannot match,
+such as the unsupported forms above, are ignored and logged at debug level.
+
+`NO_PROXY` is only read when at least one of `HTTP_PROXY` / `HTTPS_PROXY` is set.
+
+### Differences from curl
+
+| Item | curl 8.14.1 | httpjail |
+| --- | --- | --- |
+| Variable precedence | `no_proxy`, then `NO_PROXY` | `NO_PROXY`, then `no_proxy`, consistent with the other proxy variables |
+| Whitespace-only value | Counts as set, so the other spelling is not consulted | Counts as unset, falling through to the other spelling |
+| Whitespace between entries | Stops parsing the list, silently discarding the rest | Separates entries, like a comma |
+| `/0` prefix | Treated as an exact address match | Matches the whole address family |
+| Mistyped CIDR | Silently ignored | Configuration error at startup |
+| IPv6 prefix not a multiple of 8 | Inverted before curl 8.17.0 | Matches correctly, as curl 8.17.0 and later do |
+
 ## How it works
 
 - **HTTPS destinations** are reached by issuing a `CONNECT` to the upstream
@@ -45,7 +91,9 @@ rejected with an error.
   handshake over that tunnel. TLS is validated against Mozilla's webpki roots
   plus the httpjail CA, exactly as for a direct connection.
 - **Plain HTTP destinations** are forwarded to the proxy in absolute-form, with
-  the `Proxy-Authorization` header attached when credentials are configured.
+  the `Proxy-Authorization` header attached when credentials are configured. The
+  header is never sent to a destination that `NO_PROXY` bypasses, nor to an HTTPS
+  destination, whose request travels inside the tunnel to the origin server.
 - Only connection setup (the TCP connect and the `CONNECT` exchange) is bounded
   by a timeout. The established tunnel carries no timeout, so long-running
   connections such as WebSocket and gRPC keep working.

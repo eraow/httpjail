@@ -96,6 +96,14 @@ These affect httpjail's behavior:
 | `HTTPJAIL_CA_CERT`       | Custom CA certificate path             | `/etc/pki/custom-ca.pem`         |
 | `HTTP_PROXY`             | Upstream proxy for httpjail HTTP egress | `http://proxy.corp:3128`        |
 | `HTTPS_PROXY`            | Upstream proxy for httpjail HTTPS egress | `http://proxy.corp:3128`       |
+| `NO_PROXY`               | Destinations httpjail contacts directly | `internal.corp,10.0.0.0/8`      |
+
+`NO_PROXY` appears in both tables and means two different things. In the table
+above it is what httpjail *sets* for the jailed process, so that the process does
+not send its localhost traffic to httpjail. Here it is what httpjail *reads* for
+its own egress, to decide which destinations to reach without the upstream proxy.
+The value you set is used only for httpjail's own egress; it is not passed on to
+the jailed process, which would let that process bypass httpjail entirely.
 
 See [Upstream Proxy](../advanced/upstream-proxy.md) for details.
 

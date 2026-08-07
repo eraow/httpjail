@@ -30,9 +30,11 @@ use hyper::header::HeaderValue;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::TokioIo;
+use ipnet::IpNet;
 use percent_encoding::percent_decode_str;
 use std::future::Future;
 use std::io;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -54,6 +56,146 @@ const PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// A well-behaved proxy answers with a short status line and a few headers.
 const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
 
+/// The only `NO_PROXY` value that acts as a wildcard. Compared against the whole
+/// list verbatim, as curl does, so `" * "` is not a wildcard.
+const NO_PROXY_WILDCARD: &str = "*";
+
+/// One parsed `NO_PROXY` entry.
+///
+/// The destination decides which variants can apply: an IP literal destination is
+/// only ever compared against [`NoProxyRule::Ip`] and [`NoProxyRule::Net`], and a
+/// host name only against [`NoProxyRule::Domain`]. Domain rules and address rules
+/// never cross-match, matching curl.
+#[derive(Clone, Debug)]
+enum NoProxyRule {
+    /// Label-boundary suffix match. Already ASCII-lowercased with one leading
+    /// and one trailing dot removed.
+    Domain(String),
+    /// An entry without a prefix length: exact address match.
+    Ip(IpAddr),
+    /// An entry with a prefix length.
+    Net(IpNet),
+}
+
+/// The parsed `NO_PROXY` bypass list.
+///
+/// Entries are parsed once at startup so that the request path only compares.
+/// A wildcard list is not represented here: [`UpstreamProxies::from_specs`]
+/// turns it into "no upstream proxy at all" before this type is built.
+#[derive(Clone, Debug, Default)]
+struct NoProxy {
+    rules: Vec<NoProxyRule>,
+}
+
+impl NoProxy {
+    /// Parse a `NO_PROXY` list.
+    ///
+    /// Entries are separated by commas; unlike curl, whitespace separates too.
+    /// curl stops parsing the whole list at the first whitespace-separated
+    /// token, silently discarding the remainder, which loses configuration
+    /// without saying so.
+    fn parse(spec: Option<&str>) -> Result<Self> {
+        let Some(spec) = spec else {
+            return Ok(Self::default());
+        };
+
+        let mut rules = Vec::new();
+        let tokens = spec
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|token| !token.is_empty());
+        for (index, token) in tokens.enumerate() {
+            if let Some(rule) = parse_no_proxy_rule(index + 1, token)? {
+                rules.push(rule);
+            }
+        }
+        Ok(Self { rules })
+    }
+
+    /// Whether `host` (bare, as returned by [`uri_host`]) bypasses the proxy.
+    fn matches(&self, host: &str) -> bool {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return self.rules.iter().any(|rule| match rule {
+                NoProxyRule::Ip(entry) => *entry == ip,
+                NoProxyRule::Net(entry) => entry.contains(&ip),
+                NoProxyRule::Domain(_) => false,
+            });
+        }
+
+        // A single trailing dot denotes the same name; ignore it as curl does.
+        let host = host.strip_suffix('.').unwrap_or(host);
+        self.rules.iter().any(|rule| match rule {
+            NoProxyRule::Domain(entry) => domain_matches(entry, host),
+            NoProxyRule::Ip(_) | NoProxyRule::Net(_) => false,
+        })
+    }
+}
+
+/// Parse one `NO_PROXY` entry. `Ok(None)` means the entry can never match and is
+/// dropped; `Err` is a configuration error that aborts startup.
+///
+/// Neither the returned error nor any log line may contain the entry itself: a
+/// `NO_PROXY` value can hold a mistakenly pasted proxy URL with credentials, and
+/// `redact_proxy_spec` does not cover text after a slash. Only `index` and the
+/// address that already parsed successfully are reported.
+fn parse_no_proxy_rule(index: usize, token: &str) -> Result<Option<NoProxyRule>> {
+    // Treat an entry as CIDR only when the part before the slash is an address.
+    // A URL-shaped entry (`https://internal.corp`) then stays a domain entry
+    // rather than failing the whole configuration, which would refuse to start
+    // in environments where curl works.
+    if let Some((addr, _)) = token.split_once('/')
+        && let Ok(addr) = addr.parse::<IpAddr>()
+    {
+        let net = token
+            .parse::<IpNet>()
+            .map_err(|_| anyhow!("entry {} (\"{}/…\") is not a valid CIDR", index, addr))?;
+        return Ok(Some(NoProxyRule::Net(net)));
+    }
+
+    if let Ok(addr) = token.parse::<IpAddr>() {
+        return Ok(Some(NoProxyRule::Ip(addr)));
+    }
+
+    // One leading and one trailing dot are ignored, trailing first, as curl
+    // does. An entry of "." or ".." therefore becomes empty and must be dropped:
+    // an empty domain rule would suffix-match every host and bypass everything.
+    let domain = token.strip_suffix('.').unwrap_or(token);
+    let domain = domain.strip_prefix('.').unwrap_or(domain);
+    if domain.is_empty() {
+        return Ok(None);
+    }
+
+    // Host names contain neither of these, so such an entry cannot ever match.
+    // Report the position only, never the value.
+    for unmatchable in ['/', ':'] {
+        if domain.contains(unmatchable) {
+            debug!(
+                "NO_PROXY entry {} contains '{}' and can never match a host name; ignoring",
+                index, unmatchable
+            );
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(NoProxyRule::Domain(domain.to_ascii_lowercase())))
+}
+
+/// Whether `host` is `entry` itself or a subdomain of it.
+///
+/// `entry` is already lowercased; `host` is compared case-insensitively. The
+/// character before a suffix match must be a dot, so `example.com` matches
+/// `www.example.com` but not `notexample.com`. Comparison is on bytes to avoid
+/// slicing a multi-byte character.
+fn domain_matches(entry: &str, host: &str) -> bool {
+    let (entry, host) = (entry.as_bytes(), host.as_bytes());
+    let Some(offset) = host.len().checked_sub(entry.len()) else {
+        return false;
+    };
+    if !host[offset..].eq_ignore_ascii_case(entry) {
+        return false;
+    }
+    offset == 0 || host[offset - 1] == b'.'
+}
+
 /// Parsed configuration for an upstream proxy.
 #[derive(Clone, Debug)]
 pub struct UpstreamProxy {
@@ -70,60 +212,120 @@ pub struct UpstreamProxy {
 pub struct UpstreamProxies {
     http: Option<UpstreamProxy>,
     https: Option<UpstreamProxy>,
+    no_proxy: NoProxy,
 }
 
 impl UpstreamProxies {
     /// Resolve httpjail's own egress proxy settings from the proxy environment.
     pub fn from_env() -> Result<Option<Self>> {
-        let http = proxy_from_env("HTTP_PROXY", "http_proxy")?;
-        let https = proxy_from_env("HTTPS_PROXY", "https_proxy")?;
-        Ok(Self::from_proxies(http, https))
+        let (no_proxy, no_proxy_lower) = (env_var("NO_PROXY"), env_var("no_proxy"));
+        let (http, http_lower) = (env_var("HTTP_PROXY"), env_var("http_proxy"));
+        let (https, https_lower) = (env_var("HTTPS_PROXY"), env_var("https_proxy"));
+
+        Self::from_specs(
+            first_set(http.as_deref(), http_lower.as_deref()),
+            first_set(https.as_deref(), https_lower.as_deref()),
+            first_set(no_proxy.as_deref(), no_proxy_lower.as_deref()),
+        )
     }
 
+    /// Resolve the configuration from already-selected values.
+    ///
+    /// The order of the steps below is deliberate: an input is never parsed
+    /// unless its value can actually affect the outcome. Parsing eagerly would
+    /// turn an irrelevant leftover variable into a startup failure.
+    fn from_specs(
+        http: Option<&str>,
+        https: Option<&str>,
+        no_proxy: Option<&str>,
+    ) -> Result<Option<Self>> {
+        // A bare `*` disables proxying outright, so the proxy URLs are never
+        // used and must not be validated.
+        if no_proxy == Some(NO_PROXY_WILDCARD) {
+            debug!("NO_PROXY is '*': contacting all destinations directly");
+            return Ok(None);
+        }
+
+        let http = parse_optional_proxy_spec("HTTP_PROXY", http)?;
+        let https = parse_optional_proxy_spec("HTTPS_PROXY", https)?;
+
+        // Without a proxy there is nothing to bypass, so the bypass list is
+        // irrelevant and is left unparsed.
+        if http.is_none() && https.is_none() {
+            return Ok(None);
+        }
+
+        Ok(Some(Self {
+            http,
+            https,
+            no_proxy: NoProxy::parse(no_proxy).context("Failed to parse NO_PROXY")?,
+        }))
+    }
+
+    /// The proxy to use for `uri`, or `None` when the destination is contacted
+    /// directly (no proxy for that scheme, or the destination is bypassed).
     fn proxy_for_uri(&self, uri: &Uri) -> Option<&UpstreamProxy> {
-        match uri.scheme_str() {
+        let proxy = match uri.scheme_str() {
             Some("http") => self.http.as_ref(),
             Some("https") => self.https.as_ref(),
             _ => None,
+        }?;
+
+        if let Some(host) = uri_host(uri)
+            && self.no_proxy.matches(host)
+        {
+            debug!("Bypassing upstream proxy for {}", host);
+            return None;
         }
+
+        Some(proxy)
     }
 
-    pub(crate) fn http_auth(&self) -> Option<HeaderValue> {
-        self.http.as_ref().and_then(UpstreamProxy::http_auth)
+    /// The `Proxy-Authorization` value to attach to a request that is forwarded
+    /// to the proxy in absolute-form.
+    ///
+    /// `None` for HTTPS destinations: those travel inside a `CONNECT` tunnel to
+    /// the origin server, so a header added here would deliver the proxy's
+    /// credentials to the destination site itself. The tunnel's own credentials
+    /// are written by [`establish_connect_tunnel`].
+    ///
+    /// `None` for destinations that bypass the proxy, which would otherwise hand
+    /// the credentials to an arbitrary internal host.
+    pub(crate) fn http_auth_for_uri(&self, uri: &Uri) -> Option<HeaderValue> {
+        if uri.scheme_str() != Some("http") {
+            return None;
+        }
+        self.proxy_for_uri(uri).and_then(UpstreamProxy::http_auth)
     }
 
     pub(crate) fn all(proxy: UpstreamProxy) -> Self {
         Self {
             http: Some(proxy.clone()),
             https: Some(proxy),
+            no_proxy: NoProxy::default(),
         }
-    }
-
-    fn from_proxies(http: Option<UpstreamProxy>, https: Option<UpstreamProxy>) -> Option<Self> {
-        if http.is_none() && https.is_none() {
-            return None;
-        }
-        Some(Self { http, https })
-    }
-
-    #[cfg(test)]
-    fn from_specs(http: Option<&str>, https: Option<&str>) -> Result<Option<Self>> {
-        let http = parse_optional_proxy_spec("HTTP_PROXY", http)?;
-        let https = parse_optional_proxy_spec("HTTPS_PROXY", https)?;
-        Ok(Self::from_proxies(http, https))
     }
 }
 
-fn proxy_from_env(primary: &str, fallback: &str) -> Result<Option<UpstreamProxy>> {
-    for name in [primary, fallback] {
-        if let Ok(value) = std::env::var(name) {
-            let proxy = parse_optional_proxy_spec(name, Some(&value))?;
-            if proxy.is_some() {
-                return Ok(proxy);
-            }
-        }
-    }
-    Ok(None)
+fn env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// The first of the two values that is actually set, using the uppercase-first
+/// precedence httpjail applies to every proxy environment variable.
+///
+/// A value counts as unset when it is empty or contains only whitespace, so
+/// `NO_PROXY="   " no_proxy=example.com` falls through to the lowercase
+/// spelling. curl treats only a truly empty value as absent; this is a
+/// documented divergence (see docs/advanced/upstream-proxy.md).
+///
+/// The value is returned verbatim. Callers compare it against a literal (the
+/// strict `*` check), so trimming here would change what they see.
+fn first_set<'a>(primary: Option<&'a str>, fallback: Option<&'a str>) -> Option<&'a str> {
+    [primary, fallback]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.trim().is_empty())
 }
 
 fn parse_optional_proxy_spec(name: &str, spec: Option<&str>) -> Result<Option<UpstreamProxy>> {
@@ -596,6 +798,7 @@ mod tests {
         let proxies = UpstreamProxies::from_specs(
             Some("http://http-proxy.corp:3128"),
             Some("http://https-proxy.corp:8443"),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -619,8 +822,178 @@ mod tests {
 
     #[test]
     fn proxy_config_ignores_empty_specs() {
-        let proxies = UpstreamProxies::from_specs(Some("  "), None).unwrap();
+        let proxies = UpstreamProxies::from_specs(Some("  "), None, None).unwrap();
         assert!(proxies.is_none());
+    }
+
+    fn proxies_with_no_proxy(no_proxy: &str) -> UpstreamProxies {
+        UpstreamProxies::from_specs(
+            Some("http://user:pass@proxy.corp:3128"),
+            Some("http://proxy.corp:3128"),
+            Some(no_proxy),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    /// Bypass matching, asserted through `proxy_for_uri` rather than the matcher
+    /// itself: that is the entry point both the connector and the
+    /// `Proxy-Authorization` decision go through.
+    #[test]
+    fn no_proxy_bypasses_matching_destinations() {
+        // (NO_PROXY, destination, bypassed?)
+        let cases = [
+            // Apex, subdomain and the non-boundary near-miss.
+            ("example.com", "http://example.com/", true),
+            ("example.com", "http://www.example.com/", true),
+            ("example.com", "http://notexample.com/", false),
+            ("EXAMPLE.COM", "http://ExAmPlE.cOm/", true),
+            // One leading and one trailing dot are ignored, on either side.
+            (".example.com", "http://www.example.com/", true),
+            ("example.com.", "http://example.com/", true),
+            ("example.com", "http://example.com./", true),
+            // Only a list that is exactly "*" is a wildcard. `" * "` and a list
+            // containing `*` leave the token as an unmatchable domain entry.
+            (" * ", "http://anything.test/", false),
+            ("*,example.com", "http://anything.test/", false),
+            ("*,example.com", "http://example.com/", true),
+            // Addresses: CIDR, bare address, and non-byte-aligned prefixes,
+            // which curl <= 8.16.0 got backwards.
+            ("192.168.0.0/16", "http://192.168.4.5/", true),
+            ("192.168.0.0/16", "http://192.169.4.5/", false),
+            ("192.168.1.1", "http://192.168.1.1/", true),
+            ("192.168.1.1", "http://192.168.1.2/", false),
+            ("2001:db8::/32", "http://[2001:db8::1]/", true),
+            ("2001:db8::/32", "http://[2001:db9::1]/", false),
+            ("2001:db8::/65", "http://[2001:db8::1]/", true),
+            ("2001:db8::/65", "http://[2001:db8:0:0:8000::1]/", false),
+            ("::1/127", "http://[::1]/", true),
+            // Domain entries never match addresses and vice versa.
+            ("example.com", "http://192.168.1.1/", false),
+            ("192.168.0.0/16", "http://example.com/", false),
+            // Nothing here may degenerate into matching every host.
+            ("", "http://example.com/", false),
+            (".", "http://example.com/", false),
+            ("..", "http://example.com/", false),
+            (",,example.com,", "http://example.com/", true),
+            (",,example.com,", "http://other.test/", false),
+            // Unlike curl, whitespace separates instead of truncating the list.
+            ("a.test b.test", "http://a.test/", true),
+            ("a.test b.test", "http://b.test/", true),
+            // Entries that cannot match a host name are dropped, not errors.
+            ("https://internal.corp", "http://internal.corp/", false),
+            ("example.com:8080", "http://example.com/", false),
+            // The bypass applies to both schemes.
+            ("example.com", "https://example.com/", true),
+        ];
+
+        for (no_proxy, destination, bypassed) in cases {
+            let proxies = proxies_with_no_proxy(no_proxy);
+            let uri: Uri = destination.parse().unwrap();
+            assert_eq!(
+                proxies.proxy_for_uri(&uri).is_none(),
+                bypassed,
+                "NO_PROXY={:?} destination={}",
+                no_proxy,
+                destination
+            );
+        }
+    }
+
+    /// `Proxy-Authorization` must never leave the proxy it belongs to. Expected
+    /// values are written out rather than derived, so a wrong rule in
+    /// `http_auth_for_uri` cannot make the test agree with it.
+    #[test]
+    fn proxy_auth_only_for_proxied_http_destinations() {
+        let proxies = proxies_with_no_proxy("internal.corp");
+
+        // Forwarded in absolute-form to the proxy: the header belongs here.
+        assert!(
+            proxies
+                .http_auth_for_uri(&"http://proxied.example/".parse().unwrap())
+                .is_some()
+        );
+        // Connected to directly: the proxy's credentials must not be sent.
+        assert!(
+            proxies
+                .http_auth_for_uri(&"http://internal.corp/".parse().unwrap())
+                .is_none()
+        );
+        // Sent inside a CONNECT tunnel, i.e. to the origin server itself.
+        assert!(
+            proxies
+                .http_auth_for_uri(&"https://proxied.example/".parse().unwrap())
+                .is_none()
+        );
+        assert!(
+            proxies
+                .http_auth_for_uri(&"https://internal.corp/".parse().unwrap())
+                .is_none()
+        );
+    }
+
+    /// Configuration errors, and the inputs that must *not* become errors.
+    #[test]
+    fn no_proxy_configuration_errors() {
+        let proxy = Some("http://proxy.corp:3128");
+        let parse = |no_proxy: &str| UpstreamProxies::from_specs(proxy, proxy, Some(no_proxy));
+
+        // A mistyped CIDR is a typo worth reporting, not something to ignore.
+        for invalid in ["10.0.0.0/8x", "10.0.0.0/33", "2001:db8::/129"] {
+            assert!(parse(invalid).is_err(), "expected error for {:?}", invalid);
+        }
+
+        // Entries that merely cannot match must not refuse to start: curl
+        // tolerates them, and httpjail would otherwise be unusable wherever such
+        // a value is set globally.
+        for tolerated in ["https://internal.corp", "foo/bar", "", ".", "*,example.com"] {
+            assert!(
+                parse(tolerated).is_ok(),
+                "unexpected error for {tolerated:?}"
+            );
+        }
+
+        // Nothing is parsed that cannot affect the outcome: no proxy at all, and
+        // a wildcard bypass, both short-circuit before the invalid values are
+        // reached.
+        assert!(
+            UpstreamProxies::from_specs(None, None, Some("10.0.0.0/8x"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            UpstreamProxies::from_specs(Some("http://["), None, Some("*"))
+                .unwrap()
+                .is_none()
+        );
+
+        // A NO_PROXY value can hold a pasted proxy URL, so the error must not
+        // echo the entry.
+        // `{:#}` renders the whole chain, which is what reaches the user.
+        let err = format!("{:#}", parse("10.0.0.0/8@user:pass").unwrap_err());
+        assert!(
+            !err.contains("user") && !err.contains("pass"),
+            "credentials leaked into error: {err}"
+        );
+        assert!(
+            err.contains("10.0.0.0"),
+            "error lacks the entry position: {err}"
+        );
+    }
+
+    /// The uppercase spelling wins, and the value survives untouched. Shared by
+    /// every proxy variable, so this fixes the precedence for all of them.
+    #[test]
+    fn uppercase_env_spelling_wins() {
+        assert_eq!(first_set(Some("upper"), Some("lower")), Some("upper"));
+        assert_eq!(first_set(None, Some("lower")), Some("lower"));
+        assert_eq!(first_set(Some(""), Some("lower")), Some("lower"));
+        // Unlike curl, a whitespace-only value does not shadow the other spelling.
+        assert_eq!(first_set(Some("   "), Some("lower")), Some("lower"));
+        assert_eq!(first_set(None, None), None);
+        assert_eq!(first_set(Some(""), Some("  ")), None);
+        // Returned verbatim: trimming here would turn `" * "` into a wildcard.
+        assert_eq!(first_set(Some(" * "), None), Some(" * "));
     }
 
     /// Drive the proxy side of an in-memory duplex: read request headers up to

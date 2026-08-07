@@ -79,6 +79,8 @@ through the proxy.
 - `http://host:port` and bare `host:port` (http assumed) forms are accepted.
   Reaching the proxy itself over TLS (`https://proxy`) is not supported.
 - Basic authentication is supported via `http://user:pass@host:port`.
+- `NO_PROXY` lists destinations to contact directly, with curl-compatible
+  matching (domains and subdomains, `*`, IPv4/IPv6 CIDR).
 - HTTPS destinations are reached via a `CONNECT` tunnel through the proxy, while
   plain HTTP destinations are forwarded in absolute-form.
 - In weak mode, httpjail overwrites proxy env vars inside the jailed process to
