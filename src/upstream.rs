@@ -62,18 +62,22 @@ const NO_PROXY_WILDCARD: &str = "*";
 
 /// One parsed `NO_PROXY` entry.
 ///
-/// The destination decides which variants can apply: an IP literal destination is
-/// only ever compared against [`NoProxyRule::Ip`] and [`NoProxyRule::Net`], and a
-/// host name only against [`NoProxyRule::Domain`]. Domain rules and address rules
-/// never cross-match, matching curl.
+/// curl decides how to read an entry from what the *destination* is, not from
+/// what the entry looks like: against an IP literal destination every entry is
+/// read as an address or network, and against a host name destination every entry
+/// is read as a domain. So a prefix length only ever applies to an IP
+/// destination, a domain never matches an IP destination, and a bare address is
+/// also a domain candidate — `NO_PROXY=127.0.0.1` bypasses `foo.127.0.0.1` and
+/// `127.0.0.1.` as well as `127.0.0.1` itself.
 #[derive(Clone, Debug)]
 enum NoProxyRule {
     /// Label-boundary suffix match. Already ASCII-lowercased with one leading
     /// and one trailing dot removed.
     Domain(String),
-    /// An entry without a prefix length: exact address match.
-    Ip(IpAddr),
-    /// An entry with a prefix length.
+    /// An entry without a prefix length: an exact match against an IP literal
+    /// destination, and `text` as a domain against a host name destination.
+    Ip { addr: IpAddr, text: String },
+    /// An entry with a prefix length. Only an IP literal destination can match.
     Net(IpNet),
 }
 
@@ -115,7 +119,7 @@ impl NoProxy {
     fn matches(&self, host: &str) -> bool {
         if let Ok(ip) = host.parse::<IpAddr>() {
             return self.rules.iter().any(|rule| match rule {
-                NoProxyRule::Ip(entry) => *entry == ip,
+                NoProxyRule::Ip { addr, .. } => *addr == ip,
                 NoProxyRule::Net(entry) => entry.contains(&ip),
                 NoProxyRule::Domain(_) => false,
             });
@@ -125,7 +129,11 @@ impl NoProxy {
         let host = host.strip_suffix('.').unwrap_or(host);
         self.rules.iter().any(|rule| match rule {
             NoProxyRule::Domain(entry) => domain_matches(entry, host),
-            NoProxyRule::Ip(_) | NoProxyRule::Net(_) => false,
+            // A bare address is a domain candidate too, so `127.0.0.1` covers
+            // `foo.127.0.0.1`. An IPv6 entry simply never matches here, since a
+            // host name cannot contain a colon.
+            NoProxyRule::Ip { text, .. } => domain_matches(text, host),
+            NoProxyRule::Net(_) => false,
         })
     }
 }
@@ -152,7 +160,10 @@ fn parse_no_proxy_rule(index: usize, token: &str) -> Result<Option<NoProxyRule>>
     }
 
     if let Ok(addr) = token.parse::<IpAddr>() {
-        return Ok(Some(NoProxyRule::Ip(addr)));
+        return Ok(Some(NoProxyRule::Ip {
+            addr,
+            text: token.to_ascii_lowercase(),
+        }));
     }
 
     // One leading and one trailing dot are ignored, trailing first, as curl
@@ -863,6 +874,11 @@ mod tests {
             ("192.168.0.0/16", "http://192.169.4.5/", false),
             ("192.168.1.1", "http://192.168.1.1/", true),
             ("192.168.1.1", "http://192.168.1.2/", false),
+            // A bare address is read as a domain when the destination is a host
+            // name, so it covers names ending in it — still at a label boundary.
+            ("127.0.0.1", "http://foo.127.0.0.1/", true),
+            ("127.0.0.1", "http://127.0.0.1./", true),
+            ("127.0.0.1", "http://x127.0.0.1/", false),
             ("2001:db8::/32", "http://[2001:db8::1]/", true),
             ("2001:db8::/32", "http://[2001:db9::1]/", false),
             ("2001:db8::/65", "http://[2001:db8::1]/", true),

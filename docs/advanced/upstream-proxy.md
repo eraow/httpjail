@@ -50,7 +50,7 @@ the upstream proxy. The syntax follows curl 8.14.1.
 | Wildcard | `*` | Only when the whole list is exactly `*`: no proxy is used at all |
 | IPv4 CIDR | `192.168.0.0/16` | Only for destinations written as an IP literal |
 | IPv6 CIDR | `2001:db8::/32` | Only for destinations written as an IP literal |
-| Address | `192.168.1.1` | Without a prefix length, an exact address match |
+| Address | `192.168.1.1` | Without a prefix length, an exact address match. Also matches host names ending in it, since an entry is read as a domain whenever the destination is a host name |
 
 Entries are separated by commas, matched case-insensitively, and one trailing dot
 is ignored on both the entry and the destination. Rule evaluation is unaffected:
