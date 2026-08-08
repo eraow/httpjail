@@ -88,9 +88,12 @@ traffic is redirected transparently without setting proxy variables.
 
 The parent's proxy variables are never inherited by the jailed process:
 `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are removed (in both spellings) so
-the process cannot reach the upstream proxy directly or read its credentials, and
-`NO_PROXY` is set to the local addresses only rather than merged with the
-parent's value, which would let the process bypass httpjail.
+cooperating applications do not use the upstream proxy directly, and `NO_PROXY`
+is set to the local addresses only rather than merged with the parent's value,
+which would let the process bypass httpjail. This does not hide the parent
+process's environment from an untrusted command. Neither weak nor strong mode
+provides process credential isolation from httpjail itself; access depends on
+the platform, UID setup and other OS controls.
 
 ### Consumed by httpjail
 

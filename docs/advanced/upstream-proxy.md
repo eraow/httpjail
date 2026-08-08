@@ -111,9 +111,18 @@ point sandboxed processes at httpjail itself.
 The jailed process talks to httpjail; the proxy env vars only affect the hop
 from httpjail to the outside world.
 
-None of the parent's proxy variables are passed on to the jailed process, in any
-mode. `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are removed so the process
-cannot reach the upstream proxy directly or read its credentials, and `NO_PROXY`
-is replaced with the local addresses only. Inheriting `NO_PROXY` would let the
-process connect straight to every destination it named, with no rule evaluation
-at all. In weak mode httpjail then sets the proxy variables to its own address.
+None of the parent's proxy variables are included in the jailed process's own
+environment. `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are removed so
+cooperating applications do not use the upstream proxy directly, and `NO_PROXY`
+is replaced with the local addresses only. Inheriting `NO_PROXY` would let an
+application connect straight to every destination it named, with no rule
+evaluation at all. In weak mode httpjail then sets the proxy variables to its own
+address.
+
+Removing variables from the command's own environment is not credential
+isolation. Neither weak nor strong mode creates a PID namespace or otherwise
+guarantees that the command cannot inspect the httpjail process. Strong mode
+isolates network access, but visibility of the parent process and permission to
+read its environment depend on the platform, UID setup and other OS controls.
+When running an untrusted command, use a credential-free proxy or a separate OS
+or external credential boundary that prevents access to httpjail's environment.

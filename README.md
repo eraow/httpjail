@@ -86,6 +86,13 @@ through the proxy.
 - In weak mode, httpjail overwrites proxy env vars inside the jailed process to
   point sandboxed processes at httpjail itself.
 
+Removing the upstream proxy variables from the command's own environment does
+not make them secret from an untrusted command. Neither weak nor strong mode
+provides process isolation from httpjail itself, and process-inspection
+permissions depend on the platform and how httpjail was started. Do not put
+proxy credentials in the environment when running untrusted commands unless a
+separate OS or external credential boundary prevents access to them.
+
 ## Documentation
 
 Docs are stored in the `docs/` directory and served
