@@ -816,15 +816,23 @@ where
 
     let prefetched = buf.split_off(header_end).freeze();
 
-    // Only the headers are text. The tunnel bytes are arbitrary binary (a TLS
+    // HTTP field values may contain obs-text bytes, so only parse the status
+    // code token as text. The tunnel bytes are arbitrary binary as well (a TLS
     // ClientHello, typically) and must never be run through a UTF-8 check.
-    let head = std::str::from_utf8(&buf).context("Non-UTF8 CONNECT response")?;
-    let first_line = head.lines().next().unwrap_or("");
+    let first_line_end = find_subslice(&buf, b"\r\n").unwrap_or(buf.len());
+    let first_line = &buf[..first_line_end];
     let status = first_line
-        .split_whitespace()
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|token| !token.is_empty())
         .nth(1)
+        .and_then(|code| std::str::from_utf8(code).ok())
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("Malformed CONNECT status line: {:?}", first_line))?;
+        .ok_or_else(|| {
+            anyhow!(
+                "Malformed CONNECT status line: {:?}",
+                String::from_utf8_lossy(first_line)
+            )
+        })?;
 
     Ok(ConnectResponse { status, prefetched })
 }
@@ -1203,6 +1211,19 @@ mod tests {
         assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
         assert!(request.contains("Host: example.com:443\r\n"));
         assert!(request.contains("Proxy-Authorization: Basic dXNlcjpwYXNz\r\n"));
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_accepts_non_utf8_header_values() {
+        let (mut client_end, proxy_end) = tokio::io::duplex(1024);
+        tokio::spawn(fake_proxy(
+            proxy_end,
+            b"HTTP/1.1 200 Connection established\r\nX-Binary: \xff\r\n\r\n",
+        ));
+
+        establish_connect_tunnel(&mut client_end, "example.com", 443, None)
+            .await
+            .unwrap();
     }
 
     /// An IPv6 literal destination must reach the proxy as `[::1]:443`, taking
