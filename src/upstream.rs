@@ -444,9 +444,13 @@ pub fn redact_proxy_spec(spec: &str) -> String {
 /// Build a `Proxy-Authorization: Basic ...` header value from `user:pass`
 /// userinfo, percent-decoding each component first.
 fn build_basic_auth(user: &str, pass: Option<&str>) -> Result<HeaderValue> {
-    let user = percent_decode_str(user).decode_utf8_lossy();
-    let pass = percent_decode_str(pass.unwrap_or("")).decode_utf8_lossy();
-    let token = STANDARD.encode(format!("{user}:{pass}"));
+    let user = percent_decode_str(user).collect::<Vec<_>>();
+    let pass = percent_decode_str(pass.unwrap_or("")).collect::<Vec<_>>();
+    let mut credentials = Vec::with_capacity(user.len() + 1 + pass.len());
+    credentials.extend_from_slice(&user);
+    credentials.push(b':');
+    credentials.extend_from_slice(&pass);
+    let token = STANDARD.encode(credentials);
     HeaderValue::from_str(&format!("Basic {}", token))
         .context("Invalid characters in upstream proxy credentials")
 }
@@ -938,6 +942,13 @@ mod tests {
             p.auth.unwrap().to_str().unwrap(),
             "Basic dXNlcjpwQHNzOndvcmQ="
         );
+    }
+
+    #[test]
+    fn parse_credentials_preserves_non_utf8_octets() {
+        let p = UpstreamProxy::parse("http://%FF:%80@proxy.corp:3128").unwrap();
+        // base64([0xff, b':', 0x80])
+        assert_eq!(p.auth.unwrap().to_str().unwrap(), "Basic /zqA");
     }
 
     #[test]
