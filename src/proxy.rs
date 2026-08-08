@@ -3,7 +3,7 @@ use crate::dangerous_verifier::create_dangerous_client_config;
 use crate::rules::{Action, RuleEngine};
 #[allow(unused_imports)]
 use crate::tls::CertificateManager;
-use crate::upstream::{ProxyConnector, UpstreamProxies};
+use crate::upstream::{ConnectionSetupTimeout, ProxyConnector, UpstreamProxies};
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -167,8 +167,10 @@ type DirectClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<
 
 /// Upstream client that routes every re-originated request through an upstream
 /// (corporate) proxy via a [`ProxyConnector`].
-type ProxiedClient =
-    Client<hyper_rustls::HttpsConnector<ProxyConnector>, BoxBody<Bytes, HyperError>>;
+type ProxiedClient = Client<
+    ConnectionSetupTimeout<hyper_rustls::HttpsConnector<ProxyConnector>>,
+    BoxBody<Bytes, HyperError>,
+>;
 
 /// Upstream client: either contacts destinations directly or routes through a
 /// configured upstream proxy. Both variants are high-level pooled clients.
@@ -211,6 +213,7 @@ impl UpstreamClient {
                 };
                 let connector = ProxyConnector::with_config(proxies.clone());
                 let https = hyper_rustls::HttpsConnector::from((connector, config));
+                let https = ConnectionSetupTimeout::new(https);
                 debug!("Upstream client initialized to route through the upstream proxy");
                 UpstreamClient::Proxied {
                     client: build_pooled_client(https),
@@ -947,6 +950,7 @@ mod tests {
         // destination handshake on top of what the connector returns.
         let https =
             hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
+        let https = ConnectionSetupTimeout::new(https);
         let client = UpstreamClient::Proxied {
             client: build_pooled_client(https),
             proxies,
@@ -1030,6 +1034,7 @@ mod tests {
         let connector = ProxyConnector::with_config(proxies.clone());
         let https =
             hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
+        let https = ConnectionSetupTimeout::new(https);
         let client = UpstreamClient::Proxied {
             client: build_pooled_client(https),
             proxies,

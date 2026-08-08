@@ -48,9 +48,9 @@ use url::{Host, Url};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Timeout for establishing the tunnel through the upstream proxy (TCP connect
-/// and the `CONNECT` exchange). This bounds setup only; the resulting tunnel
-/// carries no timeout so long-running connections keep working.
+/// Timeout for establishing an upstream connection (TCP connect, the `CONNECT`
+/// exchange, and the destination TLS handshake). This bounds setup only; the
+/// resulting connection carries no timeout so long-running connections work.
 const PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on the size of the upstream proxy's `CONNECT` response headers.
@@ -465,6 +465,58 @@ pub struct ProxyConnector {
     proxies: Arc<UpstreamProxies>,
 }
 
+/// Bound the complete connection setup performed by an inner connector.
+///
+/// Wrapping the final HTTPS connector, rather than [`UpstreamClient::request`],
+/// includes the destination TLS handshake without placing a deadline on the
+/// established connection or its request/response streams.
+#[derive(Clone)]
+pub struct ConnectionSetupTimeout<C> {
+    inner: C,
+    duration: Duration,
+}
+
+impl<C> ConnectionSetupTimeout<C> {
+    pub(crate) fn new(inner: C) -> Self {
+        Self {
+            inner,
+            duration: PROXY_SETUP_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(inner: C, duration: Duration) -> Self {
+        Self { inner, duration }
+    }
+}
+
+impl<C> Service<Uri> for ConnectionSetupTimeout<C>
+where
+    C: Service<Uri>,
+    C::Future: Send + 'static,
+    C::Response: Send + 'static,
+    C::Error: Into<BoxError>,
+{
+    type Response = C::Response;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<C::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx).map_err(Into::into)
+    }
+
+    fn call(&mut self, dst: Uri) -> Self::Future {
+        let connect = self.inner.call(dst);
+        let duration = self.duration;
+        Box::pin(async move {
+            match timeout(duration, connect).await {
+                Ok(result) => result.map_err(Into::into),
+                Err(_) => Err(timed_out("establishing connection")),
+            }
+        })
+    }
+}
+
 impl ProxyConnector {
     pub(crate) fn with_config(proxies: UpstreamProxies) -> Self {
         let mut http = HttpConnector::new();
@@ -787,6 +839,34 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct StalledConnector;
+
+    impl Service<Uri> for StalledConnector {
+        type Response = ();
+        type Error = io::Error;
+        type Future = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _dst: Uri) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_setup_timeout_includes_inner_connector() {
+        let mut connector =
+            ConnectionSetupTimeout::with_timeout(StalledConnector, Duration::from_millis(10));
+        let err = connector
+            .call("https://target.test".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Timeout establishing connection"));
+    }
 
     #[test]
     fn parse_plain_proxy() {

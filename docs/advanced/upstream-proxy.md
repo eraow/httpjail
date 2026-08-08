@@ -94,9 +94,9 @@ such as the unsupported forms above, are ignored and logged at debug level.
   the `Proxy-Authorization` header attached when credentials are configured. The
   header is never sent to a destination that `NO_PROXY` bypasses, nor to an HTTPS
   destination, whose request travels inside the tunnel to the origin server.
-- Only connection setup (the TCP connect and the `CONNECT` exchange) is bounded
-  by a timeout. The established tunnel carries no timeout, so long-running
-  connections such as WebSocket and gRPC keep working.
+- Connection setup (the TCP connect, `CONNECT` exchange and destination TLS
+  handshake) is bounded by a timeout. The established tunnel carries no timeout,
+  so long-running connections such as WebSocket and gRPC keep working.
 
 ## Relationship to jailed process proxy variables
 
