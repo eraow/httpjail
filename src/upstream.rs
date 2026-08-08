@@ -25,6 +25,7 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hyper::Uri;
 use hyper::header::HeaderValue;
 use hyper::rt::{Read, ReadBufCursor, Write};
@@ -55,6 +56,11 @@ const PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on the size of the upstream proxy's `CONNECT` response headers.
 /// A well-behaved proxy answers with a short status line and a few headers.
 const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
+
+/// How much of the proxy's `CONNECT` response to ask for per read. Large enough
+/// that a well-behaved proxy's whole response arrives in one read, small enough
+/// that the bytes read past the headers stay a bounded prefix.
+const CONNECT_READ_CHUNK_BYTES: usize = 1024;
 
 /// The only `NO_PROXY` value that acts as a wildcard. Compared against the whole
 /// list verbatim, as curl does, so `" * "` is not a wildcard.
@@ -493,7 +499,7 @@ impl Service<Uri> for ProxyConnector {
                     Err(_) => return Err(timed_out("connecting directly to destination")),
                 };
                 let _ = tcp.set_nodelay(true);
-                return Ok(ProxyStream::new(tcp, false));
+                return Ok(ProxyStream::new(tcp, Bytes::new(), false));
             };
 
             // Dial the proxy (TCP). The destination scheme is irrelevant here;
@@ -506,25 +512,26 @@ impl Service<Uri> for ProxyConnector {
             };
             let _ = stream.set_nodelay(true);
 
-            let proxied = if dst.scheme_str() == Some("https") {
+            let (prefetched, proxied) = if dst.scheme_str() == Some("https") {
                 let host = uri_host(&dst).ok_or_else(|| {
                     BoxError::from(format!("CONNECT target has no host: {}", dst))
                 })?;
                 let port = dst.port_u16().unwrap_or(443);
-                establish_connect_tunnel(&mut stream, host, port, proxy.auth.as_ref())
-                    .await
-                    .map_err(|e| -> BoxError { e.into() })?;
+                let prefetched =
+                    establish_connect_tunnel(&mut stream, host, port, proxy.auth.as_ref())
+                        .await
+                        .map_err(|e| -> BoxError { e.into() })?;
                 // The tunnel is transparent end-to-end; destination TLS is
                 // layered on top by the surrounding HttpsConnector and the
                 // request is sent in origin-form, so do not mark it proxied.
-                false
+                (prefetched, false)
             } else {
                 // Plain HTTP: the proxy forwards absolute-form requests. Mark the
                 // connection proxied so hyper emits absolute-form request lines.
-                true
+                (Bytes::new(), true)
             };
 
-            Ok(ProxyStream::new(stream, proxied))
+            Ok(ProxyStream::new(stream, prefetched, proxied))
         })
     }
 }
@@ -538,13 +545,18 @@ fn timed_out(phase: &str) -> BoxError {
 /// consults to decide between absolute-form and origin-form request lines.
 pub struct ProxyStream {
     io: TokioIo<TcpStream>,
+    /// Tunnel bytes read ahead of time while consuming the `CONNECT` response.
+    /// Replayed before anything is taken from the socket so the byte order the
+    /// destination TLS handshake sees is unchanged.
+    prefetched: Bytes,
     proxied: bool,
 }
 
 impl ProxyStream {
-    fn new(io: TcpStream, proxied: bool) -> Self {
+    fn new(io: TcpStream, prefetched: Bytes, proxied: bool) -> Self {
         ProxyStream {
             io: TokioIo::new(io),
+            prefetched,
             proxied,
         }
     }
@@ -560,9 +572,21 @@ impl Read for ProxyStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        buf: ReadBufCursor<'_>,
+        mut buf: ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+        let this = self.get_mut();
+
+        // Drain the read-ahead first, and return without touching the socket
+        // while any of it remains. Mixing the two in one poll would reorder the
+        // stream.
+        if !this.prefetched.is_empty() {
+            let take = this.prefetched.len().min(buf.remaining());
+            buf.put_slice(&this.prefetched[..take]);
+            this.prefetched.advance(take);
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut this.io).poll_read(cx, buf)
     }
 }
 
@@ -596,14 +620,17 @@ impl Write for ProxyStream {
     }
 }
 
-/// Send a `CONNECT` request to the upstream proxy and validate its response,
-/// leaving `stream` positioned at the start of the tunnel payload on success.
+/// Send a `CONNECT` request to the upstream proxy and validate its response.
+///
+/// Returns any tunnel bytes that arrived in the same read as the end of the
+/// response headers. Those bytes belong to the tunnel and must be replayed
+/// before anything further is read from `stream`; see [`ProxyStream`].
 async fn establish_connect_tunnel<S>(
     stream: &mut S,
     host: &str,
     port: u16,
     auth: Option<&HeaderValue>,
-) -> Result<()>
+) -> Result<Bytes>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -630,25 +657,30 @@ where
         Err(_) => bail!("Timeout flushing CONNECT request to upstream proxy"),
     }
 
-    let status = match timeout(PROXY_SETUP_TIMEOUT, read_connect_status(stream)).await {
+    // One timeout for the whole exchange rather than one per read: a proxy that
+    // dribbles the response out a byte at a time would otherwise never trip a
+    // per-read deadline and could hold the setup open indefinitely.
+    let response = match timeout(PROXY_SETUP_TIMEOUT, read_connect_response(stream)).await {
         Ok(result) => result?,
         Err(_) => bail!("Timeout reading CONNECT response from upstream proxy"),
     };
 
-    if !(200..300).contains(&status) {
+    if !(200..300).contains(&response.status) {
         bail!(
             "Upstream proxy refused CONNECT to {}:{} with status {}",
             host,
             port,
-            status
+            response.status
         );
     }
 
     debug!(
-        "Established CONNECT tunnel to {}:{} via upstream proxy",
-        host, port
+        "Established CONNECT tunnel to {}:{} via upstream proxy ({} byte(s) of tunnel data already read)",
+        host,
+        port,
+        response.prefetched.len()
     );
-    Ok(())
+    Ok(response.prefetched)
 }
 
 /// The destination host as a bare host name or IP literal.
@@ -676,38 +708,80 @@ fn host_port_authority(host: &str, port: u16) -> String {
     }
 }
 
-/// Read the proxy's `CONNECT` response up to the end of its headers and return
-/// the HTTP status code. Reads are bounded by [`MAX_CONNECT_RESPONSE_BYTES`] to
-/// avoid consuming tunnel payload and to bound memory.
-async fn read_connect_status<S>(stream: &mut S) -> Result<u16>
+/// The proxy's answer to `CONNECT`, plus whatever came after it.
+struct ConnectResponse {
+    status: u16,
+    /// Tunnel bytes that arrived in the same read as the end of the headers.
+    /// Reading in chunks means the response and the first tunnel data can land
+    /// together; discarding the remainder would corrupt the TLS handshake that
+    /// follows.
+    prefetched: Bytes,
+}
+
+/// Read the proxy's `CONNECT` response up to the end of its headers.
+///
+/// Reads in chunks of [`CONNECT_READ_CHUNK_BYTES`] rather than a byte at a time,
+/// and hands back the bytes that overshot the headers instead of dropping them.
+/// The headers themselves are capped at [`MAX_CONNECT_RESPONSE_BYTES`], so memory
+/// stays within that plus one chunk.
+async fn read_connect_response<S>(stream: &mut S) -> Result<ConnectResponse>
 where
     S: AsyncRead + Unpin,
 {
-    let mut buf = Vec::with_capacity(128);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await?;
-        if n == 0 {
+    const TERMINATOR: &[u8] = b"\r\n\r\n";
+
+    let mut buf = BytesMut::with_capacity(CONNECT_READ_CHUNK_BYTES);
+    let header_end = loop {
+        let filled = buf.len();
+
+        // `BytesMut` reports nearly unbounded space, so cap each read explicitly
+        // rather than letting it size the read for us.
+        let mut chunk = (&mut buf).limit(CONNECT_READ_CHUNK_BYTES);
+        if stream.read_buf(&mut chunk).await? == 0 {
             bail!("Upstream proxy closed connection during CONNECT");
         }
-        buf.push(byte[0]);
-        if buf.ends_with(b"\r\n\r\n") {
-            break;
+
+        // A terminator can straddle two reads, so rescan the last three bytes of
+        // what was already there instead of only the newly added bytes.
+        let search_from = filled.saturating_sub(TERMINATOR.len() - 1);
+        if let Some(offset) = find_subslice(&buf[search_from..], TERMINATOR) {
+            break search_from + offset + TERMINATOR.len();
         }
-        if buf.len() > MAX_CONNECT_RESPONSE_BYTES {
+
+        // Only reached with no terminator in hand: everything read so far is
+        // header, so the cap applies to all of it.
+        if buf.len() >= MAX_CONNECT_RESPONSE_BYTES {
             bail!("Upstream proxy CONNECT response exceeded size limit");
         }
+    };
+
+    // Checked after the terminator is located, not before: a single read may
+    // carry headers within the cap plus tunnel data that pushes the total over
+    // it, and that case is a success.
+    if header_end > MAX_CONNECT_RESPONSE_BYTES {
+        bail!("Upstream proxy CONNECT response exceeded size limit");
     }
 
-    // Parse the status code from the first line, e.g.
-    // `HTTP/1.1 200 Connection established`.
+    let prefetched = buf.split_off(header_end).freeze();
+
+    // Only the headers are text. The tunnel bytes are arbitrary binary (a TLS
+    // ClientHello, typically) and must never be run through a UTF-8 check.
     let head = std::str::from_utf8(&buf).context("Non-UTF8 CONNECT response")?;
     let first_line = head.lines().next().unwrap_or("");
-    first_line
+    let status = first_line
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| anyhow!("Malformed CONNECT status line: {:?}", first_line))
+        .ok_or_else(|| anyhow!("Malformed CONNECT status line: {:?}", first_line))?;
+
+    Ok(ConnectResponse { status, prefetched })
+}
+
+/// Index of the first occurrence of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 #[cfg(test)]
@@ -1077,6 +1151,72 @@ mod tests {
             "unexpected request: {request}"
         );
         assert!(request.contains("Host: [::1]:443\r\n"));
+    }
+
+    /// Reading in chunks can pull tunnel data in with the response headers. Those
+    /// bytes belong to the TLS handshake that follows and must survive intact,
+    /// including bytes that are not valid UTF-8.
+    #[tokio::test]
+    async fn connect_tunnel_returns_bytes_read_past_the_headers() {
+        const TUNNEL: &[u8] = &[0x16, 0x03, 0x01, 0x00, 0xff, 0x00, 0x80];
+
+        let (mut client_end, mut proxy_end) = tokio::io::duplex(1024);
+        let proxy = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut byte = [0u8; 1];
+            while proxy_end.read(&mut byte).await.unwrap() != 0 {
+                buf.push(byte[0]);
+                if buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            // Headers and tunnel data in a single write, so they arrive together.
+            let mut response = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
+            response.extend_from_slice(TUNNEL);
+            proxy_end.write_all(&response).await.unwrap();
+            proxy_end.flush().await.unwrap();
+        });
+
+        let prefetched = establish_connect_tunnel(&mut client_end, "example.com", 443, None)
+            .await
+            .unwrap();
+
+        assert_eq!(prefetched.as_ref(), TUNNEL);
+        proxy.await.unwrap();
+    }
+
+    /// The read-ahead has to come out before anything from the socket, and has to
+    /// survive being read in pieces smaller than itself.
+    #[tokio::test]
+    async fn proxy_stream_replays_prefetched_bytes_before_socket_bytes() {
+        use tokio::io::AsyncReadExt as _;
+
+        const PREFIX: &[u8] = b"prefetched-";
+        const BODY: &[u8] = b"from-socket";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(BODY).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let stream = ProxyStream::new(client, Bytes::from_static(PREFIX), false);
+        let mut io = TokioIo::new(stream);
+
+        // Deliberately smaller than the prefix so the replay spans several reads.
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 4];
+        while got.len() < PREFIX.len() + BODY.len() {
+            let n = io.read(&mut chunk).await.unwrap();
+            assert_ne!(n, 0, "stream ended early: {:?}", got);
+            got.extend_from_slice(&chunk[..n]);
+        }
+
+        assert_eq!(got, [PREFIX, BODY].concat());
+        server.await.unwrap();
     }
 
     #[tokio::test]
