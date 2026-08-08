@@ -451,8 +451,10 @@ fn build_basic_auth(user: &str, pass: Option<&str>) -> Result<HeaderValue> {
     credentials.push(b':');
     credentials.extend_from_slice(&pass);
     let token = STANDARD.encode(credentials);
-    HeaderValue::from_str(&format!("Basic {}", token))
-        .context("Invalid characters in upstream proxy credentials")
+    let mut value = HeaderValue::from_str(&format!("Basic {}", token))
+        .context("Invalid characters in upstream proxy credentials")?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 /// A hyper connector that routes outbound connections through an
@@ -949,6 +951,13 @@ mod tests {
         let p = UpstreamProxy::parse("http://%FF:%80@proxy.corp:3128").unwrap();
         // base64([0xff, b':', 0x80])
         assert_eq!(p.auth.unwrap().to_str().unwrap(), "Basic /zqA");
+    }
+
+    #[test]
+    fn proxy_credentials_are_sensitive() {
+        let p = UpstreamProxy::parse("http://user:secret@proxy.corp:3128").unwrap();
+        assert!(p.auth.as_ref().unwrap().is_sensitive());
+        assert!(!format!("{p:?}").contains("dXNlcjpzZWNyZXQ="));
     }
 
     #[test]
