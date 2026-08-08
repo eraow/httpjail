@@ -315,6 +315,10 @@ impl UpstreamProxies {
         self.proxy_for_uri(uri).and_then(UpstreamProxy::http_auth)
     }
 
+    /// Route every scheme through one proxy, with no bypass list. Only the
+    /// tests build a configuration this way; `from_specs` is the real entry
+    /// point.
+    #[cfg(test)]
     pub(crate) fn all(proxy: UpstreamProxy) -> Self {
         Self {
             http: Some(proxy.clone()),
@@ -462,11 +466,7 @@ pub struct ProxyConnector {
 }
 
 impl ProxyConnector {
-    pub fn new(proxy: UpstreamProxy) -> Self {
-        Self::with_config(UpstreamProxies::all(proxy))
-    }
-
-    pub fn with_config(proxies: UpstreamProxies) -> Self {
+    pub(crate) fn with_config(proxies: UpstreamProxies) -> Self {
         let mut http = HttpConnector::new();
         // The proxy is addressed via an http(s) URL; allow non-http schemes so
         // the connector does not reject the dial target.
