@@ -3,25 +3,22 @@
 By default httpjail contacts destination servers directly. When httpjail itself
 runs in an environment that has no direct internet access — for example behind a
 corporate proxy — you can route httpjail's own outbound requests through an
-upstream proxy with `--upstream-proxy` (or the `HTTPJAIL_UPSTREAM_PROXY`
-environment variable).
+upstream proxy with the `HTTP_PROXY` and/or `HTTPS_PROXY` environment variables.
 
 Rule evaluation still happens locally on the intercepted traffic. Only the
 request that httpjail re-originates towards the real destination is forwarded
 through the upstream proxy.
 
 ```bash
-# Route httpjail's egress through a corporate proxy
-httpjail --upstream-proxy http://proxy.corp:3128 --js "true" -- curl https://api.github.com
+# Route httpjail's HTTPS egress through a corporate proxy
+HTTPS_PROXY=http://proxy.corp:3128 httpjail --js "true" -- curl https://api.github.com
+
+# Route both HTTP and HTTPS egress through the same proxy
+HTTP_PROXY=http://proxy.corp:3128 HTTPS_PROXY=http://proxy.corp:3128 \
+  httpjail --js "true" -- ./my-app
 
 # With Basic authentication
-httpjail --upstream-proxy http://user:pass@proxy.corp:3128 --js "true" -- ./my-app
-
-# Through an HTTPS proxy
-httpjail --upstream-proxy https://proxy.corp:8443 --js "true" -- ./my-app
-
-# Via the environment variable (equivalent to --upstream-proxy)
-HTTPJAIL_UPSTREAM_PROXY=http://proxy.corp:3128 httpjail --js "true" -- ./my-app
+HTTPS_PROXY=http://user:pass@proxy.corp:3128 httpjail --js "true" -- ./my-app
 ```
 
 ## Accepted formats
@@ -29,12 +26,17 @@ HTTPJAIL_UPSTREAM_PROXY=http://proxy.corp:3128 httpjail --js "true" -- ./my-app
 | Form | Example | Notes |
 | --- | --- | --- |
 | `http://host:port` | `http://proxy.corp:3128` | Plain HTTP proxy |
-| `https://host:port` | `https://proxy.corp:8443` | Connection to the proxy is wrapped in TLS |
 | `host:port` | `proxy.corp:3128` | Bare authority, `http` scheme assumed |
 | With credentials | `http://user:pass@proxy.corp:3128` | Sends `Proxy-Authorization: Basic ...` |
 
-The command-line flag takes precedence over the environment variable. Credentials
-are never written to the logs.
+`HTTP_PROXY` is used for `http://` destinations. `HTTPS_PROXY` is used for
+`https://` destinations. Credentials are never written to the logs.
+
+Note that the value describes how httpjail reaches the proxy, not the scheme of
+the destinations it covers: `HTTPS_PROXY=http://proxy.corp:3128` is the normal
+configuration and sends HTTPS destinations through a plain HTTP proxy. Reaching
+the proxy itself over TLS (an `https://` proxy URL) is not supported and is
+rejected with an error.
 
 ## How it works
 
@@ -44,18 +46,19 @@ are never written to the logs.
   plus the httpjail CA, exactly as for a direct connection.
 - **Plain HTTP destinations** are forwarded to the proxy in absolute-form, with
   the `Proxy-Authorization` header attached when credentials are configured.
-- Only connection setup (TCP connect, optional TLS to the proxy, and the
-  `CONNECT` exchange) is bounded by a timeout. The established tunnel carries no
-  timeout, so long-running connections such as WebSocket and gRPC keep working.
+- Only connection setup (the TCP connect and the `CONNECT` exchange) is bounded
+  by a timeout. The established tunnel carries no timeout, so long-running
+  connections such as WebSocket and gRPC keep working.
 
-## Relationship to `HTTP_PROXY` / `HTTPS_PROXY`
+## Relationship to jailed process proxy variables
 
-This feature is independent of the `HTTP_PROXY` and `HTTPS_PROXY` variables that
-httpjail sets *inside* the jail to point sandboxed processes at httpjail itself.
+The proxy environment variables configure httpjail's own egress. In weak mode,
+httpjail overwrites `HTTP_PROXY` and `HTTPS_PROXY` inside the jailed process to
+point sandboxed processes at httpjail itself.
 
 ```
-[ jailed process ] --HTTP_PROXY/HTTPS_PROXY--> [ httpjail ] --upstream-proxy--> [ corporate proxy ] --> internet
+[ jailed process ] --> [ httpjail ] --HTTP_PROXY/HTTPS_PROXY--> [ corporate proxy ] --> internet
 ```
 
-The jailed process always talks to httpjail; `--upstream-proxy` only affects the
-hop from httpjail to the outside world.
+The jailed process talks to httpjail; the proxy env vars only affect the hop
+from httpjail to the outside world.

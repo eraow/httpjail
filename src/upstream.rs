@@ -31,39 +31,28 @@ use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::TokioIo;
 use percent_encoding::percent_decode_str;
-use rustls::pki_types::ServerName;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
-use tokio_rustls::TlsConnector;
 use tower_service::Service;
 use tracing::debug;
 use url::{Host, Url};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Timeout for establishing the tunnel through the upstream proxy (TCP connect,
-/// optional TLS to the proxy and the `CONNECT` exchange). This bounds setup
-/// only; the resulting tunnel carries no timeout so long-running connections
-/// keep working.
+/// Timeout for establishing the tunnel through the upstream proxy (TCP connect
+/// and the `CONNECT` exchange). This bounds setup only; the resulting tunnel
+/// carries no timeout so long-running connections keep working.
 const PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on the size of the upstream proxy's `CONNECT` response headers.
 /// A well-behaved proxy answers with a short status line and a few headers.
 const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
-
-/// Object-safe combination of the async byte-stream traits we erase over so the
-/// connector can hold either a plain TCP stream or a TLS stream (when the proxy
-/// itself is reached over `https://`) behind a single type.
-trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
-
-/// A heap-erased byte stream carrying the connection to the proxy.
-type BoxedIo = Box<dyn IoStream>;
 
 /// Parsed configuration for an upstream proxy.
 #[derive(Clone, Debug)]
@@ -72,17 +61,88 @@ pub struct UpstreamProxy {
     host: String,
     /// Proxy port.
     port: u16,
-    /// Whether the connection to the proxy itself is wrapped in TLS (an
-    /// `https://` proxy URL).
-    tls: bool,
     /// Pre-built `Proxy-Authorization` header value when credentials are given.
     auth: Option<HeaderValue>,
 }
 
+/// Upstream proxy configuration resolved from the proxy environment.
+#[derive(Clone, Debug)]
+pub struct UpstreamProxies {
+    http: Option<UpstreamProxy>,
+    https: Option<UpstreamProxy>,
+}
+
+impl UpstreamProxies {
+    /// Resolve httpjail's own egress proxy settings from the proxy environment.
+    pub fn from_env() -> Result<Option<Self>> {
+        let http = proxy_from_env("HTTP_PROXY", "http_proxy")?;
+        let https = proxy_from_env("HTTPS_PROXY", "https_proxy")?;
+        Ok(Self::from_proxies(http, https))
+    }
+
+    fn proxy_for_uri(&self, uri: &Uri) -> Option<&UpstreamProxy> {
+        match uri.scheme_str() {
+            Some("http") => self.http.as_ref(),
+            Some("https") => self.https.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn http_auth(&self) -> Option<HeaderValue> {
+        self.http.as_ref().and_then(UpstreamProxy::http_auth)
+    }
+
+    pub(crate) fn all(proxy: UpstreamProxy) -> Self {
+        Self {
+            http: Some(proxy.clone()),
+            https: Some(proxy),
+        }
+    }
+
+    fn from_proxies(http: Option<UpstreamProxy>, https: Option<UpstreamProxy>) -> Option<Self> {
+        if http.is_none() && https.is_none() {
+            return None;
+        }
+        Some(Self { http, https })
+    }
+
+    #[cfg(test)]
+    fn from_specs(http: Option<&str>, https: Option<&str>) -> Result<Option<Self>> {
+        let http = parse_optional_proxy_spec("HTTP_PROXY", http)?;
+        let https = parse_optional_proxy_spec("HTTPS_PROXY", https)?;
+        Ok(Self::from_proxies(http, https))
+    }
+}
+
+fn proxy_from_env(primary: &str, fallback: &str) -> Result<Option<UpstreamProxy>> {
+    for name in [primary, fallback] {
+        if let Ok(value) = std::env::var(name) {
+            let proxy = parse_optional_proxy_spec(name, Some(&value))?;
+            if proxy.is_some() {
+                return Ok(proxy);
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn parse_optional_proxy_spec(name: &str, spec: Option<&str>) -> Result<Option<UpstreamProxy>> {
+    let Some(spec) = spec.map(str::trim).filter(|spec| !spec.is_empty()) else {
+        return Ok(None);
+    };
+    UpstreamProxy::parse(spec)
+        .map(Some)
+        .with_context(|| format!("Failed to parse {name}"))
+}
+
 impl UpstreamProxy {
     /// Parse an upstream proxy specification such as `http://proxy.corp:3128`,
-    /// `http://user:pass@proxy.corp:3128`, `https://proxy.corp:8443` or a bare
-    /// `proxy.corp:3128` (the `http` scheme is then assumed).
+    /// `http://user:pass@proxy.corp:3128` or a bare `proxy.corp:3128` (the
+    /// `http` scheme is then assumed).
+    ///
+    /// Reaching the proxy itself over TLS (an `https://` proxy URL) is not
+    /// supported; HTTPS *destinations* are tunneled through a plain HTTP proxy
+    /// with `CONNECT`.
     pub fn parse(spec: &str) -> Result<Self> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -98,15 +158,20 @@ impl UpstreamProxy {
         let url = Url::parse(&normalized)
             .with_context(|| format!("Invalid upstream proxy URL: {}", redacted_spec))?;
 
-        let tls = match url.scheme() {
-            "http" => false,
-            "https" => true,
+        match url.scheme() {
+            "http" => {}
+            "https" => bail!(
+                "Connecting to an upstream proxy over TLS is not supported: {}. \
+                 Use an 'http://' proxy URL; HTTPS destinations are still \
+                 tunneled through it with CONNECT.",
+                redacted_spec
+            ),
             other => bail!(
                 "Unsupported upstream proxy scheme '{}': {}",
                 other,
                 redacted_spec
             ),
-        };
+        }
 
         let host = match url.host() {
             Some(Host::Domain(host)) => host.to_string(),
@@ -125,12 +190,7 @@ impl UpstreamProxy {
             None
         };
 
-        Ok(UpstreamProxy {
-            host,
-            port,
-            tls,
-            auth,
-        })
+        Ok(UpstreamProxy { host, port, auth })
     }
 
     /// The `Proxy-Authorization` header value, if credentials were supplied.
@@ -179,13 +239,15 @@ fn build_basic_auth(user: &str, pass: Option<&str>) -> Result<HeaderValue> {
 pub struct ProxyConnector {
     /// Used solely to dial the proxy's `host:port` (never the destination).
     http: HttpConnector,
-    proxy: Arc<UpstreamProxy>,
-    /// TLS configuration used only when the proxy itself is `https://`.
-    proxy_tls: Arc<rustls::ClientConfig>,
+    proxies: Arc<UpstreamProxies>,
 }
 
 impl ProxyConnector {
-    pub fn new(proxy: UpstreamProxy, proxy_tls: Arc<rustls::ClientConfig>) -> Self {
+    pub fn new(proxy: UpstreamProxy) -> Self {
+        Self::with_config(UpstreamProxies::all(proxy))
+    }
+
+    pub fn with_config(proxies: UpstreamProxies) -> Self {
         let mut http = HttpConnector::new();
         // The proxy is addressed via an http(s) URL; allow non-http schemes so
         // the connector does not reject the dial target.
@@ -193,8 +255,7 @@ impl ProxyConnector {
         http.set_happy_eyeballs_timeout(Some(Duration::from_millis(250)));
         ProxyConnector {
             http,
-            proxy: Arc::new(proxy),
-            proxy_tls,
+            proxies: Arc::new(proxies),
         }
     }
 }
@@ -210,34 +271,27 @@ impl Service<Uri> for ProxyConnector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let mut http = self.http.clone();
-        let proxy = Arc::clone(&self.proxy);
-        let proxy_tls = Arc::clone(&self.proxy_tls);
+        let proxy = self.proxies.proxy_for_uri(&dst).cloned();
 
         Box::pin(async move {
+            let Some(proxy) = proxy else {
+                let tcp = match timeout(PROXY_SETUP_TIMEOUT, http.call(dst.clone())).await {
+                    Ok(result) => result?.into_inner(),
+                    Err(_) => return Err(timed_out("connecting directly to destination")),
+                };
+                let _ = tcp.set_nodelay(true);
+                return Ok(ProxyStream::new(tcp, false));
+            };
+
             // Dial the proxy (TCP). The destination scheme is irrelevant here;
             // we always connect to the proxy's host:port.
-            let proxy_uri: Uri = format!("http://{}", host_port_authority(&proxy.host, proxy.port))
-                .parse()?;
-            let tcp = match timeout(PROXY_SETUP_TIMEOUT, http.call(proxy_uri)).await {
+            let proxy_uri: Uri =
+                format!("http://{}", host_port_authority(&proxy.host, proxy.port)).parse()?;
+            let mut stream = match timeout(PROXY_SETUP_TIMEOUT, http.call(proxy_uri)).await {
                 Ok(result) => result?.into_inner(),
                 Err(_) => return Err(timed_out("connecting to upstream proxy")),
             };
-            let _ = tcp.set_nodelay(true);
-
-            // Optionally negotiate TLS with the proxy itself.
-            let mut stream: BoxedIo = if proxy.tls {
-                let name = ServerName::try_from(proxy.host.clone()).map_err(|_| {
-                    BoxError::from(format!("Invalid proxy host for TLS SNI: {}", proxy.host))
-                })?;
-                let connector = TlsConnector::from(Arc::clone(&proxy_tls));
-                let tls = match timeout(PROXY_SETUP_TIMEOUT, connector.connect(name, tcp)).await {
-                    Ok(result) => result?,
-                    Err(_) => return Err(timed_out("during TLS handshake with upstream proxy")),
-                };
-                Box::new(tls)
-            } else {
-                Box::new(tcp)
-            };
+            let _ = stream.set_nodelay(true);
 
             let proxied = if dst.scheme_str() == Some("https") {
                 let host = dst.host().ok_or_else(|| {
@@ -270,12 +324,12 @@ fn timed_out(phase: &str) -> BoxError {
 /// The connector's response: a byte stream plus the proxied flag that hyper
 /// consults to decide between absolute-form and origin-form request lines.
 pub struct ProxyStream {
-    io: TokioIo<BoxedIo>,
+    io: TokioIo<TcpStream>,
     proxied: bool,
 }
 
 impl ProxyStream {
-    fn new(io: BoxedIo, proxied: bool) -> Self {
+    fn new(io: TcpStream, proxied: bool) -> Self {
         ProxyStream {
             io: TokioIo::new(io),
             proxied,
@@ -437,7 +491,6 @@ mod tests {
         let p = UpstreamProxy::parse("http://proxy.corp:3128").unwrap();
         assert_eq!(p.host, "proxy.corp");
         assert_eq!(p.port, 3128);
-        assert!(!p.tls);
         assert!(p.auth.is_none());
     }
 
@@ -446,7 +499,6 @@ mod tests {
         let p = UpstreamProxy::parse("http://proxy.corp:3128/path?ignored=true#frag").unwrap();
         assert_eq!(p.host, "proxy.corp");
         assert_eq!(p.port, 3128);
-        assert!(!p.tls);
     }
 
     #[test]
@@ -454,14 +506,18 @@ mod tests {
         let p = UpstreamProxy::parse("proxy.corp:8080").unwrap();
         assert_eq!(p.host, "proxy.corp");
         assert_eq!(p.port, 8080);
-        assert!(!p.tls);
     }
 
+    /// Reaching the proxy itself over TLS is not supported; the error must say
+    /// so rather than silently treating the proxy as plain HTTP.
     #[test]
-    fn parse_https_proxy_default_port() {
-        let p = UpstreamProxy::parse("https://proxy.corp").unwrap();
-        assert!(p.tls);
-        assert_eq!(p.port, 443);
+    fn reject_tls_proxy_scheme() {
+        let err = UpstreamProxy::parse("https://proxy.corp:8443").unwrap_err();
+        assert!(
+            err.to_string().contains("over TLS is not supported"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -518,6 +574,38 @@ mod tests {
     #[test]
     fn reject_empty_spec() {
         assert!(UpstreamProxy::parse("   ").is_err());
+    }
+
+    #[test]
+    fn proxy_config_uses_specs_by_scheme() {
+        let proxies = UpstreamProxies::from_specs(
+            Some("http://http-proxy.corp:3128"),
+            Some("http://https-proxy.corp:8443"),
+        )
+        .unwrap()
+        .unwrap();
+
+        let http_uri: Uri = "http://example.com/".parse().unwrap();
+        let https_uri: Uri = "https://example.com/".parse().unwrap();
+
+        assert_eq!(
+            proxies
+                .proxy_for_uri(&http_uri)
+                .map(|proxy| proxy.host.as_str()),
+            Some("http-proxy.corp")
+        );
+        assert_eq!(
+            proxies
+                .proxy_for_uri(&https_uri)
+                .map(|proxy| proxy.host.as_str()),
+            Some("https-proxy.corp")
+        );
+    }
+
+    #[test]
+    fn proxy_config_ignores_empty_specs() {
+        let proxies = UpstreamProxies::from_specs(Some("  "), None).unwrap();
+        assert!(proxies.is_none());
     }
 
     /// Drive the proxy side of an in-memory duplex: read request headers up to
