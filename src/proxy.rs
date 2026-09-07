@@ -229,10 +229,8 @@ impl UpstreamClient {
         match self {
             UpstreamClient::Direct(client) => client.request(req).await.map_err(Into::into),
             UpstreamClient::Proxied { client, proxies } => {
-                if req.uri().scheme_str() == Some("http")
-                    && let Some(auth) = proxies.http_auth()
-                {
-                    req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
+                if let Some(auth) = proxies.http_auth_for_uri(req.uri()) {
+                    req.headers_mut().insert(PROXY_AUTHORIZATION, auth);
                 }
                 client.request(req).await.map_err(Into::into)
             }

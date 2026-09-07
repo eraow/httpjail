@@ -314,9 +314,7 @@ impl DockerLinux {
         // The parent process may use proxy env vars for httpjail's own egress.
         // Do not leak those credentials or settings into the Docker CLI process;
         // Docker network isolation routes container traffic through httpjail.
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
-            cmd.env_remove(key);
-        }
+        crate::jail::remove_parent_proxy_env(&mut cmd);
 
         // Use our isolated Docker network
         cmd.args(["--network", &network_name]);

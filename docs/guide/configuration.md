@@ -84,7 +84,10 @@ traffic is redirected transparently without setting proxy variables.
 | `HTTPS_PROXY`   | HTTPS proxy address          | `http://127.0.0.1:34567` |
 | `SSL_CERT_FILE` | CA certificate path          | `/tmp/httpjail-ca.pem`   |
 | `SSL_CERT_DIR`  | CA certificate directory     | `/tmp/httpjail-certs/`   |
-| `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1`    |
+| `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1,::1` |
+
+The parent's proxy variables are not inherited. In weak mode, `NO_PROXY`
+contains only the local addresses needed to reach httpjail.
 
 ### Consumed by httpjail
 
@@ -96,6 +99,10 @@ These affect httpjail's behavior:
 | `HTTPJAIL_CA_CERT`       | Custom CA certificate path             | `/etc/pki/custom-ca.pem`         |
 | `HTTP_PROXY`             | Upstream proxy for httpjail HTTP egress | `http://proxy.corp:3128`        |
 | `HTTPS_PROXY`            | Upstream proxy for httpjail HTTPS egress | `http://proxy.corp:3128`       |
+| `NO_PROXY`               | Destinations httpjail contacts directly | `internal.corp,10.0.0.0/8`      |
+
+The configured `NO_PROXY` applies only to httpjail's own egress; it is not
+passed to the jailed process, which would allow that process to bypass httpjail.
 
 See [Upstream Proxy](../advanced/upstream-proxy.md) for details.
 
