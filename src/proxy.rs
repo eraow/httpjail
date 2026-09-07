@@ -855,6 +855,147 @@ mod tests {
         ));
     }
 
+    /// The whole HTTPS path in one go: the connector opens a CONNECT tunnel
+    /// through the proxy, the HttpsConnector layers the destination TLS on top of
+    /// it, and the request reaches the origin server.
+    ///
+    /// Each half is covered on its own elsewhere; nothing else checks that they
+    /// compose. Skipping the CONNECT, tunneling to the wrong authority, or
+    /// failing to run the destination handshake over the tunnel all fail here.
+    ///
+    /// Note that the origin-form assertion below records the wire shape rather
+    /// than guarding the `proxied` flag: hyper-util's `absolute_form()` falls
+    /// back to origin-form for HTTPS URIs on its own, so marking the tunnel
+    /// proxied would not change what the origin sees.
+    #[tokio::test]
+    async fn https_destination_through_connect_tunnel_reaches_origin() {
+        use http_body_util::Empty;
+        use hyper::server::conn::http1 as server_http1;
+        use hyper::service::service_fn;
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        const ORIGIN_HOST: &str = "target.test";
+        const BODY: &str = "through-connect-ok";
+
+        // Origin: a real TLS server with its own self-signed certificate, so the
+        // handshake has to succeed over the tunnel for the request to arrive.
+        let cert = rcgen::generate_simple_self_signed(vec![ORIGIN_HOST.to_string()]).unwrap();
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
+            )
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+
+        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+        let seen_uri = Arc::new(Mutex::new(String::new()));
+        let origin_seen_uri = Arc::clone(&seen_uri);
+        let origin = tokio::spawn(async move {
+            let (sock, _) = origin_listener.accept().await.unwrap();
+            let tls = acceptor.accept(sock).await.unwrap();
+            let service = service_fn(move |req: Request<Incoming>| {
+                let seen = Arc::clone(&origin_seen_uri);
+                async move {
+                    *seen.lock().unwrap() = req.uri().to_string();
+                    Ok::<_, HyperError>(
+                        Response::builder()
+                            // Close after one response so the tunnel copy ends.
+                            .header(hyper::header::CONNECTION, "close")
+                            .body(Full::new(Bytes::from(BODY)))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = server_http1::Builder::new()
+                .serve_connection(TokioIo::new(tls), service)
+                .await;
+        });
+
+        // Proxy: answer CONNECT, then splice the connection to the origin.
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+        let proxy = tokio::spawn(async move {
+            let (mut client, _) = proxy_listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while client.read(&mut byte).await.unwrap() != 0 {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let mut origin = TcpStream::connect(origin_addr).await.unwrap();
+            client
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut origin).await;
+            String::from_utf8_lossy(&head).into_owned()
+        });
+
+        let upstream =
+            crate::upstream::UpstreamProxy::parse(&format!("http://{proxy_addr}")).unwrap();
+        let proxies = UpstreamProxies::all(upstream);
+        let connector = ProxyConnector::with_config(proxies.clone());
+        // The HttpsConnector is the point of the test: it must be able to run the
+        // destination handshake on top of what the connector returns.
+        let https =
+            hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
+        let client = UpstreamClient::Proxied {
+            client: build_pooled_client(https),
+            proxies,
+        };
+
+        let body = Empty::<Bytes>::new()
+            .map_err(|never| match never {})
+            .boxed();
+        let req = Request::builder()
+            .uri(format!(
+                "https://{ORIGIN_HOST}:{}/through-connect",
+                origin_addr.port()
+            ))
+            .body(body)
+            .unwrap();
+
+        // One bound over the whole exchange, not just the request: a regression
+        // that stalls after the response headers, or leaves the tunnel copy
+        // running, would otherwise hang here instead of failing.
+        let exchange = async move {
+            let resp = client.request(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(got, Bytes::from(BODY));
+
+            // Let the pooled connection go so the tunnel copy sees EOF.
+            drop(client);
+            let connect_head = proxy.await.unwrap();
+            origin.await.unwrap();
+            connect_head
+        };
+        let connect_head = tokio::time::timeout(Duration::from_secs(3), exchange)
+            .await
+            .expect("timed out waiting for the tunneled request to complete");
+
+        // The proxy is dialed by address but must be asked for the destination.
+        assert!(
+            connect_head.starts_with(&format!(
+                "CONNECT {ORIGIN_HOST}:{} HTTP/1.1\r\n",
+                origin_addr.port()
+            )),
+            "unexpected CONNECT request: {connect_head}"
+        );
+        // Reaching the origin at all proves the tunnel and the destination
+        // handshake worked; the path confirms the request was not rewritten on
+        // the way through.
+        assert_eq!(seen_uri.lock().unwrap().as_str(), "/through-connect");
+    }
+
     /// A plain-HTTP request routed through an upstream proxy must be forwarded in
     /// absolute-form with the configured `Proxy-Authorization` header.
     #[tokio::test]
@@ -885,8 +1026,8 @@ mod tests {
 
         let proxy =
             crate::upstream::UpstreamProxy::parse(&format!("http://user:pass@{}", addr)).unwrap();
-        let proxies = UpstreamProxies::all(proxy.clone());
-        let connector = ProxyConnector::new(proxy);
+        let proxies = UpstreamProxies::all(proxy);
+        let connector = ProxyConnector::with_config(proxies.clone());
         let https =
             hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
         let client = UpstreamClient::Proxied {
