@@ -7,6 +7,7 @@ use httpjail::rules::shell::ShellRuleEngine;
 use httpjail::rules::v8_js::V8JsRuleEngine;
 use httpjail::rules::{Action, RuleEngine};
 use hyper::Method;
+use std::fmt;
 use std::fs::OpenOptions;
 use std::os::unix::process::ExitStatusExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +41,7 @@ enum Command {
     },
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser)]
 struct RunArgs {
     /// Use shell script for evaluating requests
     /// The script receives environment variables:
@@ -84,6 +85,13 @@ struct RunArgs {
     /// Append requests to a log file
     #[arg(long = "request-log", value_name = "FILE")]
     request_log: Option<String>,
+
+    /// Route httpjail's own upstream requests through an upstream (corporate) proxy.
+    /// Accepts http://host:port, https://host:port, or host:port (http assumed),
+    /// optionally with credentials: http://user:pass@host:port.
+    /// Falls back to the HTTPJAIL_UPSTREAM_PROXY environment variable.
+    #[arg(long = "upstream-proxy", value_name = "URL")]
+    upstream_proxy: Option<String>,
 
     /// Use weak mode (environment variables only, no system isolation)
     #[arg(long = "weak")]
@@ -137,6 +145,32 @@ struct RunArgs {
     /// Command and arguments to execute  
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     exec_command: Vec<String>,
+}
+
+impl fmt::Debug for RunArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let upstream_proxy = self
+            .upstream_proxy
+            .as_deref()
+            .map(httpjail::upstream::redact_proxy_spec);
+        f.debug_struct("RunArgs")
+            .field("sh", &self.sh)
+            .field("proc", &self.proc)
+            .field("js", &self.js)
+            .field("js_file", &self.js_file)
+            .field("request_log", &self.request_log)
+            .field("upstream_proxy", &upstream_proxy)
+            .field("weak", &self.weak)
+            .field("verbose", &self.verbose)
+            .field("timeout", &self.timeout)
+            .field("no_jail_cleanup", &self.no_jail_cleanup)
+            .field("cleanup", &self.cleanup)
+            .field("server", &self.server)
+            .field("test", &self.test)
+            .field("docker_run", &self.docker_run)
+            .field("exec_command", &self.exec_command)
+            .finish()
+    }
 }
 
 fn setup_logging(verbosity: u8) {
@@ -590,18 +624,27 @@ async fn main() -> Result<()> {
         }
     };
 
-    let upstream_proxies = httpjail::upstream::UpstreamProxies::from_env()
-        .context("Failed to configure upstream proxy from environment")?;
-    if upstream_proxies.is_some() {
-        debug!("Routing httpjail upstream requests through the proxy environment");
-    }
+    // Resolve the optional upstream (corporate) proxy from the flag or env var.
+    // This is independent of the HTTP_PROXY/HTTPS_PROXY variables httpjail sets
+    // *inside* the jail to point sandboxed processes at itself.
+    let upstream_proxy_spec = args
+        .run_args
+        .upstream_proxy
+        .clone()
+        .or_else(|| std::env::var("HTTPJAIL_UPSTREAM_PROXY").ok());
+    let upstream_proxy = match upstream_proxy_spec {
+        Some(spec) => {
+            let proxy = httpjail::upstream::UpstreamProxy::parse(&spec)
+                .with_context(|| format!("Failed to parse upstream proxy: {}", spec))?;
+            // Avoid logging the spec verbatim as it may contain credentials.
+            info!("Routing httpjail upstream requests through the configured upstream proxy");
+            Some(proxy)
+        }
+        None => None,
+    };
 
-    let mut proxy = ProxyServer::new_with_upstream_proxies(
-        http_bind,
-        https_bind,
-        rule_engine,
-        upstream_proxies,
-    );
+    let mut proxy =
+        ProxyServer::new_with_upstream_proxy(http_bind, https_bind, rule_engine, upstream_proxy);
 
     // Start proxy in background if running as server; otherwise start with random ports
     let (actual_http_port, actual_https_port) = proxy.start().await?;

@@ -64,34 +64,25 @@ httpjail --server --js "true"
 httpjail --js "r.host === 'api.github.com'" --docker-run -- --rm alpine:latest wget -qO- https://api.github.com
 
 # Route httpjail's own egress through an upstream (corporate) proxy
-HTTPS_PROXY=http://proxy.corp:3128 httpjail --js "true" -- curl https://api.github.com
-# Basic authentication is supported: http://user:pass@proxy.corp:3128
+httpjail --upstream-proxy http://proxy.corp:3128 --js "true" -- curl https://api.github.com
+# Credentials and HTTPS proxies are supported: http://user:pass@proxy.corp:3128, https://proxy.corp:8443
+# May also be set via the HTTPJAIL_UPSTREAM_PROXY environment variable
 ```
 
 ### Upstream (corporate) proxy
 
-When httpjail itself runs in an environment with no direct internet access, set
-the `HTTP_PROXY` and/or `HTTPS_PROXY` environment variables to route httpjail's
-outbound requests through an upstream proxy. Rule evaluation still happens
-locally on the intercepted traffic; only the re-originated request is forwarded
-through the proxy.
+When httpjail itself runs in an environment with no direct internet access, use
+`--upstream-proxy <URL>` (or the `HTTPJAIL_UPSTREAM_PROXY` environment variable)
+to route httpjail's outbound requests through an upstream proxy. Rule evaluation
+still happens locally on the intercepted traffic; only the re-originated request
+is forwarded through the proxy.
 
-- `http://host:port` and bare `host:port` (http assumed) forms are accepted.
-  Reaching the proxy itself over TLS (`https://proxy`) is not supported.
+- `http://`, `https://` and bare `host:port` (http assumed) forms are accepted.
 - Basic authentication is supported via `http://user:pass@host:port`.
-- `NO_PROXY` lists destinations to contact directly, with curl-compatible
-  matching (domains and subdomains, `*`, IPv4/IPv6 CIDR).
 - HTTPS destinations are reached via a `CONNECT` tunnel through the proxy, while
   plain HTTP destinations are forwarded in absolute-form.
-- In weak mode, httpjail overwrites proxy env vars inside the jailed process to
-  point sandboxed processes at httpjail itself.
-
-Removing the upstream proxy variables from the command's own environment does
-not make them secret from an untrusted command. Neither weak nor strong mode
-provides process isolation from httpjail itself, and process-inspection
-permissions depend on the platform and how httpjail was started. Do not put
-proxy credentials in the environment when running untrusted commands unless a
-separate OS or external credential boundary prevents access to them.
+- This is independent of the `HTTP_PROXY`/`HTTPS_PROXY` variables that httpjail
+  sets *inside* the jail to point sandboxed processes at itself.
 
 ## Documentation
 

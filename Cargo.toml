@@ -39,7 +39,6 @@ camino = "1.1.11"
 filetime = "0.2"
 ctrlc = "3.4"
 percent-encoding = "2.3"
-ipnet = "2"
 url = "2.5"
 v8 = "129"
 serde = { version = "1.0", features = ["derive"] }

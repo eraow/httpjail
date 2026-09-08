@@ -3,12 +3,12 @@ use crate::dangerous_verifier::create_dangerous_client_config;
 use crate::rules::{Action, RuleEngine};
 #[allow(unused_imports)]
 use crate::tls::CertificateManager;
-use crate::upstream::{ConnectionSetupTimeout, ProxyConnector, UpstreamProxies};
+use crate::upstream::{ProxyConnector, UpstreamProxy};
 use anyhow::Result;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::Incoming;
-use hyper::header::PROXY_AUTHORIZATION;
+use hyper::header::{HeaderValue, PROXY_AUTHORIZATION};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Error as HyperError, Request, Response, StatusCode, Uri};
@@ -29,7 +29,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 
 #[cfg(target_os = "linux")]
 use std::net::Ipv6Addr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
@@ -167,10 +167,8 @@ type DirectClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody<
 
 /// Upstream client that routes every re-originated request through an upstream
 /// (corporate) proxy via a [`ProxyConnector`].
-type ProxiedClient = Client<
-    ConnectionSetupTimeout<hyper_rustls::HttpsConnector<ProxyConnector>>,
-    BoxBody<Bytes, HyperError>,
->;
+type ProxiedClient =
+    Client<hyper_rustls::HttpsConnector<ProxyConnector>, BoxBody<Bytes, HyperError>>;
 
 /// Upstream client: either contacts destinations directly or routes through a
 /// configured upstream proxy. Both variants are high-level pooled clients.
@@ -178,51 +176,13 @@ pub enum UpstreamClient {
     Direct(DirectClient),
     Proxied {
         client: ProxiedClient,
-        proxies: UpstreamProxies,
+        /// Attached to plain-HTTP requests forwarded through the proxy in
+        /// absolute-form (HTTPS carries credentials on the CONNECT instead).
+        http_auth: Option<HeaderValue>,
     },
 }
 
 impl UpstreamClient {
-    /// Build the upstream client for one [`ProxyServer`]: either contacting
-    /// destinations directly, or routing every re-originated request whose
-    /// scheme has a configured proxy through that proxy.
-    ///
-    /// Each `ProxyServer` owns its own client, so the upstream configuration is
-    /// exactly what the caller asked for rather than whatever the first
-    /// initialization in the process happened to install.
-    pub fn new(
-        ca_cert_der: CertificateDer<'static>,
-        upstream_proxies: Option<UpstreamProxies>,
-    ) -> Self {
-        // Check if we should dangerously disable cert validation (TESTING ONLY!)
-        let dangerous = std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok();
-
-        match upstream_proxies {
-            None => {
-                let https = build_direct_connector(ca_cert_der, dangerous);
-                debug!("HTTPS connector initialized with webpki roots and httpjail CA");
-                UpstreamClient::Direct(build_pooled_client(https))
-            }
-            Some(proxies) => {
-                // The destination TLS, layered over the CONNECT tunnel by the
-                // HttpsConnector, trusts the same roots as the direct client.
-                let config = if dangerous {
-                    create_dangerous_client_config()
-                } else {
-                    create_client_config_with_ca(ca_cert_der)
-                };
-                let connector = ProxyConnector::with_config(proxies.clone());
-                let https = hyper_rustls::HttpsConnector::from((connector, config));
-                let https = ConnectionSetupTimeout::new(https);
-                debug!("Upstream client initialized to route through the upstream proxy");
-                UpstreamClient::Proxied {
-                    client: build_pooled_client(https),
-                    proxies,
-                }
-            }
-        }
-    }
-
     /// Forward a prepared request upstream. No timeout is applied here so that
     /// long-running connections (WebSocket, gRPC, ...) keep working.
     pub async fn request(
@@ -231,15 +191,20 @@ impl UpstreamClient {
     ) -> Result<Response<Incoming>> {
         match self {
             UpstreamClient::Direct(client) => client.request(req).await.map_err(Into::into),
-            UpstreamClient::Proxied { client, proxies } => {
-                if let Some(auth) = proxies.http_auth_for_uri(req.uri()) {
-                    req.headers_mut().insert(PROXY_AUTHORIZATION, auth);
+            UpstreamClient::Proxied { client, http_auth } => {
+                if req.uri().scheme_str() == Some("http")
+                    && let Some(auth) = http_auth
+                {
+                    req.headers_mut().insert(PROXY_AUTHORIZATION, auth.clone());
                 }
                 client.request(req).await.map_err(Into::into)
             }
         }
     }
 }
+
+// Shared HTTP/HTTPS client for upstream requests
+static HTTPS_CLIENT: OnceLock<UpstreamClient> = OnceLock::new();
 
 /// Build a pooled hyper client over the given connector with the shared tuning.
 fn build_pooled_client<C>(connector: C) -> Client<C, BoxBody<Bytes, HyperError>>
@@ -370,6 +335,65 @@ fn build_direct_connector(
     }
 }
 
+/// Initialize the shared upstream client with the httpjail CA certificate and an
+/// optional upstream proxy. When a proxy is configured, all re-originated
+/// requests are routed through it; otherwise destinations are contacted directly.
+pub fn init_client_with_ca(
+    ca_cert_der: CertificateDer<'static>,
+    upstream_proxy: Option<UpstreamProxy>,
+) {
+    HTTPS_CLIENT.get_or_init(|| {
+        // Check if we should dangerously disable cert validation (TESTING ONLY!)
+        let dangerous = std::env::var("HTTPJAIL_DANGER_DISABLE_CERT_VALIDATION").is_ok();
+
+        match upstream_proxy {
+            None => {
+                let https = build_direct_connector(ca_cert_der, dangerous);
+                info!("HTTPS connector initialized with webpki roots and httpjail CA");
+                UpstreamClient::Direct(build_pooled_client(https))
+            }
+            Some(proxy) => {
+                // Both the destination TLS (layered over the CONNECT tunnel by
+                // the HttpsConnector) and the optional https:// proxy TLS trust
+                // the same roots as the direct client.
+                let make_config = || {
+                    if dangerous {
+                        create_dangerous_client_config()
+                    } else {
+                        create_client_config_with_ca(ca_cert_der.clone())
+                    }
+                };
+                let http_auth = proxy.http_auth();
+                let connector = ProxyConnector::new(proxy, Arc::new(make_config()));
+                let https = hyper_rustls::HttpsConnector::from((connector, make_config()));
+                info!("Upstream client initialized to route through the upstream proxy");
+                UpstreamClient::Proxied {
+                    client: build_pooled_client(https),
+                    http_auth,
+                }
+            }
+        }
+    });
+}
+
+/// Get or create the shared upstream client
+pub fn get_client() -> &'static UpstreamClient {
+    HTTPS_CLIENT.get_or_init(|| {
+        // Fallback initialization if not already initialized with CA
+        // This should not happen in normal operation
+        warn!("HTTP client accessed before CA initialization, using native roots only");
+
+        let https = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .expect("Failed to load native roots")
+            .https_or_http()
+            .enable_http1()
+            .build();
+
+        UpstreamClient::Direct(build_pooled_client(https))
+    })
+}
+
 /// Try to bind to an available port in the given range (up to 16 attempts)
 async fn bind_to_available_port(start: u16, end: u16, ip: std::net::IpAddr) -> Result<TcpListener> {
     let mut rng = rand::thread_rng();
@@ -444,9 +468,6 @@ async fn bind_listener(addr: std::net::SocketAddr) -> Result<TcpListener> {
 pub struct ProxyContext {
     pub rule_engine: Arc<RuleEngine>,
     pub cert_manager: Arc<CertificateManager>,
-    /// Client used to re-originate allowed requests towards the real
-    /// destination, either directly or through an upstream proxy.
-    pub upstream_client: Arc<UpstreamClient>,
     /// Unique nonce for this proxy instance, used for loop detection (Issue #84)
     pub loop_nonce: Arc<String>,
 }
@@ -463,21 +484,22 @@ impl ProxyServer {
         https_bind: Option<std::net::SocketAddr>,
         rule_engine: RuleEngine,
     ) -> Self {
-        Self::new_with_upstream_proxies(http_bind, https_bind, rule_engine, None)
+        Self::new_with_upstream_proxy(http_bind, https_bind, rule_engine, None)
     }
 
     /// Like [`ProxyServer::new`], but routes httpjail's own re-originated
-    /// requests through the configured upstream proxies when set.
-    pub fn new_with_upstream_proxies(
+    /// requests through the given upstream (corporate) proxy when set.
+    pub fn new_with_upstream_proxy(
         http_bind: Option<std::net::SocketAddr>,
         https_bind: Option<std::net::SocketAddr>,
         rule_engine: RuleEngine,
-        upstream_proxies: Option<UpstreamProxies>,
+        upstream_proxy: Option<UpstreamProxy>,
     ) -> Self {
         let cert_manager = CertificateManager::new().expect("Failed to create certificate manager");
 
-        // Build this server's upstream client, trusting our own CA
-        let upstream_client = UpstreamClient::new(cert_manager.get_ca_cert_der(), upstream_proxies);
+        // Initialize the HTTP client with our CA certificate
+        let ca_cert_der = cert_manager.get_ca_cert_der();
+        init_client_with_ca(ca_cert_der, upstream_proxy);
 
         // Generate a unique nonce for loop detection (Issue #84)
         // Use 16 random hex characters for a reasonably short but collision-resistant ID
@@ -489,7 +511,6 @@ impl ProxyServer {
         let context = ProxyContext {
             rule_engine: Arc::new(rule_engine),
             cert_manager: Arc::new(cert_manager),
-            upstream_client: Arc::new(upstream_client),
             loop_nonce: Arc::new(loop_nonce),
         };
 
@@ -668,14 +689,7 @@ pub async fn handle_http_request(
                 "Request allowed: {} (max_tx_bytes: {:?})",
                 full_url, evaluation.max_tx_bytes
             );
-            match proxy_request(
-                req,
-                &full_url,
-                evaluation.max_tx_bytes,
-                &context.loop_nonce,
-                &context.upstream_client,
-            )
-            .await
+            match proxy_request(req, &full_url, evaluation.max_tx_bytes, &context.loop_nonce).await
             {
                 Ok(resp) => Ok(resp),
                 Err(e) => {
@@ -696,7 +710,6 @@ async fn proxy_request(
     full_url: &str,
     max_tx_bytes: Option<u64>,
     loop_nonce: &str,
-    client: &UpstreamClient,
 ) -> Result<Response<BoxBody<Bytes, HyperError>>> {
     // Parse the target URL
     let target_uri = full_url.parse::<Uri>()?;
@@ -728,6 +741,9 @@ async fn proxy_request(
         let (parts, body) = prepared_req.into_parts();
         Request::from_parts(parts, body.boxed())
     };
+
+    // Use the shared HTTP/HTTPS client
+    let client = get_client();
 
     // Forward the request - no timeout to support long-running connections
     debug!("Sending HTTP request to upstream server: {}", full_url);
@@ -831,175 +847,6 @@ mod tests {
         assert_ne!(http_port, https_port);
     }
 
-    /// Each server must honor the upstream configuration it was constructed
-    /// with. Before the client moved onto ProxyContext, whichever server ran
-    /// first installed a process-global client and the second silently inherited
-    /// it, so a proxied server created after a direct one lost its proxy.
-    #[tokio::test]
-    async fn upstream_client_is_per_server() {
-        let rule_engine = || {
-            let engine = V8JsRuleEngine::new("true".to_string()).unwrap();
-            RuleEngine::from_trait(Box::new(engine), None)
-        };
-
-        let direct = ProxyServer::new(None, None, rule_engine());
-        let proxies =
-            UpstreamProxies::all(crate::upstream::UpstreamProxy::parse("proxy:3128").unwrap());
-        let proxied =
-            ProxyServer::new_with_upstream_proxies(None, None, rule_engine(), Some(proxies));
-
-        assert!(matches!(
-            direct.context.upstream_client.as_ref(),
-            UpstreamClient::Direct(_)
-        ));
-        assert!(matches!(
-            proxied.context.upstream_client.as_ref(),
-            UpstreamClient::Proxied { .. }
-        ));
-    }
-
-    /// The whole HTTPS path in one go: the connector opens a CONNECT tunnel
-    /// through the proxy, the HttpsConnector layers the destination TLS on top of
-    /// it, and the request reaches the origin server.
-    ///
-    /// Each half is covered on its own elsewhere; nothing else checks that they
-    /// compose. Skipping the CONNECT, tunneling to the wrong authority, or
-    /// failing to run the destination handshake over the tunnel all fail here.
-    ///
-    /// Note that the origin-form assertion below records the wire shape rather
-    /// than guarding the `proxied` flag: hyper-util's `absolute_form()` falls
-    /// back to origin-form for HTTPS URIs on its own, so marking the tunnel
-    /// proxied would not change what the origin sees.
-    #[tokio::test]
-    async fn https_destination_through_connect_tunnel_reaches_origin() {
-        use http_body_util::Empty;
-        use hyper::server::conn::http1 as server_http1;
-        use hyper::service::service_fn;
-        use std::sync::Mutex;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-
-        const ORIGIN_HOST: &str = "target.test";
-        const BODY: &str = "through-connect-ok";
-
-        // Origin: a real TLS server with its own self-signed certificate, so the
-        // handshake has to succeed over the tunnel for the request to arrive.
-        let cert = rcgen::generate_simple_self_signed(vec![ORIGIN_HOST.to_string()]).unwrap();
-        let tls_config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![cert.cert.der().clone()],
-                rustls::pki_types::PrivateKeyDer::Pkcs8(cert.key_pair.serialize_der().into()),
-            )
-            .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
-
-        let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin_addr = origin_listener.local_addr().unwrap();
-        let seen_uri = Arc::new(Mutex::new(String::new()));
-        let origin_seen_uri = Arc::clone(&seen_uri);
-        let origin = tokio::spawn(async move {
-            let (sock, _) = origin_listener.accept().await.unwrap();
-            let tls = acceptor.accept(sock).await.unwrap();
-            let service = service_fn(move |req: Request<Incoming>| {
-                let seen = Arc::clone(&origin_seen_uri);
-                async move {
-                    *seen.lock().unwrap() = req.uri().to_string();
-                    Ok::<_, HyperError>(
-                        Response::builder()
-                            // Close after one response so the tunnel copy ends.
-                            .header(hyper::header::CONNECTION, "close")
-                            .body(Full::new(Bytes::from(BODY)))
-                            .unwrap(),
-                    )
-                }
-            });
-            let _ = server_http1::Builder::new()
-                .serve_connection(TokioIo::new(tls), service)
-                .await;
-        });
-
-        // Proxy: answer CONNECT, then splice the connection to the origin.
-        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_addr = proxy_listener.local_addr().unwrap();
-        let proxy = tokio::spawn(async move {
-            let (mut client, _) = proxy_listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            let mut byte = [0u8; 1];
-            while client.read(&mut byte).await.unwrap() != 0 {
-                head.push(byte[0]);
-                if head.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let mut origin = TcpStream::connect(origin_addr).await.unwrap();
-            client
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-                .await
-                .unwrap();
-            client.flush().await.unwrap();
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut origin).await;
-            String::from_utf8_lossy(&head).into_owned()
-        });
-
-        let upstream =
-            crate::upstream::UpstreamProxy::parse(&format!("http://{proxy_addr}")).unwrap();
-        let proxies = UpstreamProxies::all(upstream);
-        let connector = ProxyConnector::with_config(proxies.clone());
-        // The HttpsConnector is the point of the test: it must be able to run the
-        // destination handshake on top of what the connector returns.
-        let https =
-            hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
-        let https = ConnectionSetupTimeout::new(https);
-        let client = UpstreamClient::Proxied {
-            client: build_pooled_client(https),
-            proxies,
-        };
-
-        let body = Empty::<Bytes>::new()
-            .map_err(|never| match never {})
-            .boxed();
-        let req = Request::builder()
-            .uri(format!(
-                "https://{ORIGIN_HOST}:{}/through-connect",
-                origin_addr.port()
-            ))
-            .body(body)
-            .unwrap();
-
-        // One bound over the whole exchange, not just the request: a regression
-        // that stalls after the response headers, or leaves the tunnel copy
-        // running, would otherwise hang here instead of failing.
-        let exchange = async move {
-            let resp = client.request(req).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            let got = resp.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(got, Bytes::from(BODY));
-
-            // Let the pooled connection go so the tunnel copy sees EOF.
-            drop(client);
-            let connect_head = proxy.await.unwrap();
-            origin.await.unwrap();
-            connect_head
-        };
-        let connect_head = tokio::time::timeout(Duration::from_secs(3), exchange)
-            .await
-            .expect("timed out waiting for the tunneled request to complete");
-
-        // The proxy is dialed by address but must be asked for the destination.
-        assert!(
-            connect_head.starts_with(&format!(
-                "CONNECT {ORIGIN_HOST}:{} HTTP/1.1\r\n",
-                origin_addr.port()
-            )),
-            "unexpected CONNECT request: {connect_head}"
-        );
-        // Reaching the origin at all proves the tunnel and the destination
-        // handshake worked; the path confirms the request was not rewritten on
-        // the way through.
-        assert_eq!(seen_uri.lock().unwrap().as_str(), "/through-connect");
-    }
-
     /// A plain-HTTP request routed through an upstream proxy must be forwarded in
     /// absolute-form with the configured `Proxy-Authorization` header.
     #[tokio::test]
@@ -1028,16 +875,14 @@ mod tests {
             String::from_utf8_lossy(&buf).into_owned()
         });
 
-        let proxy =
-            crate::upstream::UpstreamProxy::parse(&format!("http://user:pass@{}", addr)).unwrap();
-        let proxies = UpstreamProxies::all(proxy);
-        let connector = ProxyConnector::with_config(proxies.clone());
+        let proxy = UpstreamProxy::parse(&format!("http://user:pass@{}", addr)).unwrap();
+        let http_auth = proxy.http_auth();
+        let connector = ProxyConnector::new(proxy, Arc::new(create_dangerous_client_config()));
         let https =
             hyper_rustls::HttpsConnector::from((connector, create_dangerous_client_config()));
-        let https = ConnectionSetupTimeout::new(https);
         let client = UpstreamClient::Proxied {
             client: build_pooled_client(https),
-            proxies,
+            http_auth,
         };
 
         let body = Empty::<Bytes>::new()

@@ -25,193 +25,45 @@
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use hyper::Uri;
 use hyper::header::HeaderValue;
 use hyper::rt::{Read, ReadBufCursor, Write};
 use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::TokioIo;
-use ipnet::IpNet;
 use percent_encoding::percent_decode_str;
+use rustls::pki_types::ServerName;
 use std::future::Future;
 use std::io;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
+use tokio_rustls::TlsConnector;
 use tower_service::Service;
 use tracing::debug;
 use url::{Host, Url};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Timeout for establishing an upstream connection (TCP connect, the `CONNECT`
-/// exchange, and the destination TLS handshake). This bounds setup only; the
-/// resulting connection carries no timeout so long-running connections work.
+/// Timeout for establishing the tunnel through the upstream proxy (TCP connect,
+/// optional TLS to the proxy and the `CONNECT` exchange). This bounds setup
+/// only; the resulting tunnel carries no timeout so long-running connections
+/// keep working.
 const PROXY_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Upper bound on the size of the upstream proxy's `CONNECT` response headers.
 /// A well-behaved proxy answers with a short status line and a few headers.
 const MAX_CONNECT_RESPONSE_BYTES: usize = 16 * 1024;
 
-/// How much of the proxy's `CONNECT` response to ask for per read. Large enough
-/// that a well-behaved proxy's whole response arrives in one read, small enough
-/// that the bytes read past the headers stay a bounded prefix.
-const CONNECT_READ_CHUNK_BYTES: usize = 1024;
+/// Object-safe combination of the async byte-stream traits we erase over so the
+/// connector can hold either a plain TCP stream or a TLS stream (when the proxy
+/// itself is reached over `https://`) behind a single type.
+trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
-/// The only `NO_PROXY` value that acts as a wildcard. Compared against the whole
-/// list verbatim, as curl does, so `" * "` is not a wildcard.
-const NO_PROXY_WILDCARD: &str = "*";
-
-/// One parsed `NO_PROXY` entry.
-///
-/// curl decides how to read an entry from what the *destination* is, not from
-/// what the entry looks like: against an IP literal destination every entry is
-/// read as an address or network, and against a host name destination every entry
-/// is read as a domain. So a prefix length only ever applies to an IP
-/// destination, a domain never matches an IP destination, and a bare address is
-/// also a domain candidate — `NO_PROXY=127.0.0.1` bypasses `foo.127.0.0.1` and
-/// `127.0.0.1.` as well as `127.0.0.1` itself.
-#[derive(Clone, Debug)]
-enum NoProxyRule {
-    /// Label-boundary suffix match. Already ASCII-lowercased with one leading
-    /// and one trailing dot removed.
-    Domain(String),
-    /// An entry without a prefix length: an exact match against an IP literal
-    /// destination, and `text` as a domain against a host name destination.
-    Ip { addr: IpAddr, text: String },
-    /// An entry with a prefix length. Only an IP literal destination can match.
-    Net(IpNet),
-}
-
-/// The parsed `NO_PROXY` bypass list.
-///
-/// Entries are parsed once at startup so that the request path only compares.
-/// A wildcard list is not represented here: [`UpstreamProxies::from_specs`]
-/// turns it into "no upstream proxy at all" before this type is built.
-#[derive(Clone, Debug, Default)]
-struct NoProxy {
-    rules: Vec<NoProxyRule>,
-}
-
-impl NoProxy {
-    /// Parse a `NO_PROXY` list.
-    ///
-    /// Entries are separated by commas; unlike curl, whitespace separates too.
-    /// curl stops parsing the whole list at the first whitespace-separated
-    /// token, silently discarding the remainder, which loses configuration
-    /// without saying so.
-    fn parse(spec: Option<&str>) -> Result<Self> {
-        let Some(spec) = spec else {
-            return Ok(Self::default());
-        };
-
-        let mut rules = Vec::new();
-        let tokens = spec
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|token| !token.is_empty());
-        for (index, token) in tokens.enumerate() {
-            if let Some(rule) = parse_no_proxy_rule(index + 1, token)? {
-                rules.push(rule);
-            }
-        }
-        Ok(Self { rules })
-    }
-
-    /// Whether `host` (bare, as returned by [`uri_host`]) bypasses the proxy.
-    fn matches(&self, host: &str) -> bool {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            return self.rules.iter().any(|rule| match rule {
-                NoProxyRule::Ip { addr, .. } => *addr == ip,
-                NoProxyRule::Net(entry) => entry.contains(&ip),
-                NoProxyRule::Domain(_) => false,
-            });
-        }
-
-        // A single trailing dot denotes the same name; ignore it as curl does.
-        let host = host.strip_suffix('.').unwrap_or(host);
-        self.rules.iter().any(|rule| match rule {
-            NoProxyRule::Domain(entry) => domain_matches(entry, host),
-            // A bare address is a domain candidate too, so `127.0.0.1` covers
-            // `foo.127.0.0.1`. An IPv6 entry simply never matches here, since a
-            // host name cannot contain a colon.
-            NoProxyRule::Ip { text, .. } => domain_matches(text, host),
-            NoProxyRule::Net(_) => false,
-        })
-    }
-}
-
-/// Parse one `NO_PROXY` entry. `Ok(None)` means the entry can never match and is
-/// dropped; `Err` is a configuration error that aborts startup.
-///
-/// Neither the returned error nor any log line may contain the entry itself: a
-/// `NO_PROXY` value can hold a mistakenly pasted proxy URL with credentials, and
-/// `redact_proxy_spec` does not cover text after a slash. Only `index` and the
-/// address that already parsed successfully are reported.
-fn parse_no_proxy_rule(index: usize, token: &str) -> Result<Option<NoProxyRule>> {
-    // Treat an entry as CIDR only when the part before the slash is an address.
-    // A URL-shaped entry (`https://internal.corp`) then stays a domain entry
-    // rather than failing the whole configuration, which would refuse to start
-    // in environments where curl works.
-    if let Some((addr, _)) = token.split_once('/')
-        && let Ok(addr) = addr.parse::<IpAddr>()
-    {
-        let net = token
-            .parse::<IpNet>()
-            .map_err(|_| anyhow!("entry {} (\"{}/…\") is not a valid CIDR", index, addr))?;
-        return Ok(Some(NoProxyRule::Net(net)));
-    }
-
-    if let Ok(addr) = token.parse::<IpAddr>() {
-        return Ok(Some(NoProxyRule::Ip {
-            addr,
-            text: token.to_ascii_lowercase(),
-        }));
-    }
-
-    // One leading and one trailing dot are ignored, trailing first, as curl
-    // does. An entry of "." or ".." therefore becomes empty and must be dropped:
-    // an empty domain rule would suffix-match every host and bypass everything.
-    let domain = token.strip_suffix('.').unwrap_or(token);
-    let domain = domain.strip_prefix('.').unwrap_or(domain);
-    if domain.is_empty() {
-        return Ok(None);
-    }
-
-    // Host names contain neither of these, so such an entry cannot ever match.
-    // Report the position only, never the value.
-    for unmatchable in ['/', ':'] {
-        if domain.contains(unmatchable) {
-            debug!(
-                "NO_PROXY entry {} contains '{}' and can never match a host name; ignoring",
-                index, unmatchable
-            );
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(NoProxyRule::Domain(domain.to_ascii_lowercase())))
-}
-
-/// Whether `host` is `entry` itself or a subdomain of it.
-///
-/// `entry` is already lowercased; `host` is compared case-insensitively. The
-/// character before a suffix match must be a dot, so `example.com` matches
-/// `www.example.com` but not `notexample.com`. Comparison is on bytes to avoid
-/// slicing a multi-byte character.
-fn domain_matches(entry: &str, host: &str) -> bool {
-    let (entry, host) = (entry.as_bytes(), host.as_bytes());
-    let Some(offset) = host.len().checked_sub(entry.len()) else {
-        return false;
-    };
-    if !host[offset..].eq_ignore_ascii_case(entry) {
-        return false;
-    }
-    offset == 0 || host[offset - 1] == b'.'
-}
+/// A heap-erased byte stream carrying the connection to the proxy.
+type BoxedIo = Box<dyn IoStream>;
 
 /// Parsed configuration for an upstream proxy.
 #[derive(Clone, Debug)]
@@ -220,152 +72,17 @@ pub struct UpstreamProxy {
     host: String,
     /// Proxy port.
     port: u16,
+    /// Whether the connection to the proxy itself is wrapped in TLS (an
+    /// `https://` proxy URL).
+    tls: bool,
     /// Pre-built `Proxy-Authorization` header value when credentials are given.
     auth: Option<HeaderValue>,
 }
 
-/// Upstream proxy configuration resolved from the proxy environment.
-#[derive(Clone, Debug)]
-pub struct UpstreamProxies {
-    http: Option<UpstreamProxy>,
-    https: Option<UpstreamProxy>,
-    no_proxy: NoProxy,
-}
-
-impl UpstreamProxies {
-    /// Resolve httpjail's own egress proxy settings from the proxy environment.
-    pub fn from_env() -> Result<Option<Self>> {
-        let (no_proxy, no_proxy_lower) = (env_var("NO_PROXY"), env_var("no_proxy"));
-        let (http, http_lower) = (env_var("HTTP_PROXY"), env_var("http_proxy"));
-        let (https, https_lower) = (env_var("HTTPS_PROXY"), env_var("https_proxy"));
-
-        Self::from_specs(
-            first_set(http.as_deref(), http_lower.as_deref()),
-            first_set(https.as_deref(), https_lower.as_deref()),
-            first_set(no_proxy.as_deref(), no_proxy_lower.as_deref()),
-        )
-    }
-
-    /// Resolve the configuration from already-selected values.
-    ///
-    /// The order of the steps below is deliberate: an input is never parsed
-    /// unless its value can actually affect the outcome. Parsing eagerly would
-    /// turn an irrelevant leftover variable into a startup failure.
-    fn from_specs(
-        http: Option<&str>,
-        https: Option<&str>,
-        no_proxy: Option<&str>,
-    ) -> Result<Option<Self>> {
-        // A bare `*` disables proxying outright, so the proxy URLs are never
-        // used and must not be validated.
-        if no_proxy == Some(NO_PROXY_WILDCARD) {
-            debug!("NO_PROXY is '*': contacting all destinations directly");
-            return Ok(None);
-        }
-
-        let http = parse_optional_proxy_spec("HTTP_PROXY", http)?;
-        let https = parse_optional_proxy_spec("HTTPS_PROXY", https)?;
-
-        // Without a proxy there is nothing to bypass, so the bypass list is
-        // irrelevant and is left unparsed.
-        if http.is_none() && https.is_none() {
-            return Ok(None);
-        }
-
-        Ok(Some(Self {
-            http,
-            https,
-            no_proxy: NoProxy::parse(no_proxy).context("Failed to parse NO_PROXY")?,
-        }))
-    }
-
-    /// The proxy to use for `uri`, or `None` when the destination is contacted
-    /// directly (no proxy for that scheme, or the destination is bypassed).
-    fn proxy_for_uri(&self, uri: &Uri) -> Option<&UpstreamProxy> {
-        let proxy = match uri.scheme_str() {
-            Some("http") => self.http.as_ref(),
-            Some("https") => self.https.as_ref(),
-            _ => None,
-        }?;
-
-        if let Some(host) = uri_host(uri)
-            && self.no_proxy.matches(host)
-        {
-            debug!("Bypassing upstream proxy for {}", host);
-            return None;
-        }
-
-        Some(proxy)
-    }
-
-    /// The `Proxy-Authorization` value to attach to a request that is forwarded
-    /// to the proxy in absolute-form.
-    ///
-    /// `None` for HTTPS destinations: those travel inside a `CONNECT` tunnel to
-    /// the origin server, so a header added here would deliver the proxy's
-    /// credentials to the destination site itself. The tunnel's own credentials
-    /// are written by [`establish_connect_tunnel`].
-    ///
-    /// `None` for destinations that bypass the proxy, which would otherwise hand
-    /// the credentials to an arbitrary internal host.
-    pub(crate) fn http_auth_for_uri(&self, uri: &Uri) -> Option<HeaderValue> {
-        if uri.scheme_str() != Some("http") {
-            return None;
-        }
-        self.proxy_for_uri(uri).and_then(UpstreamProxy::http_auth)
-    }
-
-    /// Route every scheme through one proxy, with no bypass list. Only the
-    /// tests build a configuration this way; `from_specs` is the real entry
-    /// point.
-    #[cfg(test)]
-    pub(crate) fn all(proxy: UpstreamProxy) -> Self {
-        Self {
-            http: Some(proxy.clone()),
-            https: Some(proxy),
-            no_proxy: NoProxy::default(),
-        }
-    }
-}
-
-fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
-
-/// The first of the two values that is actually set, using the uppercase-first
-/// precedence httpjail applies to every proxy environment variable.
-///
-/// A value counts as unset when it is empty or contains only whitespace, so
-/// `NO_PROXY="   " no_proxy=example.com` falls through to the lowercase
-/// spelling. curl treats only a truly empty value as absent; this is a
-/// documented divergence (see docs/advanced/upstream-proxy.md).
-///
-/// The value is returned verbatim. Callers compare it against a literal (the
-/// strict `*` check), so trimming here would change what they see.
-fn first_set<'a>(primary: Option<&'a str>, fallback: Option<&'a str>) -> Option<&'a str> {
-    [primary, fallback]
-        .into_iter()
-        .flatten()
-        .find(|value| !value.trim().is_empty())
-}
-
-fn parse_optional_proxy_spec(name: &str, spec: Option<&str>) -> Result<Option<UpstreamProxy>> {
-    let Some(spec) = spec.map(str::trim).filter(|spec| !spec.is_empty()) else {
-        return Ok(None);
-    };
-    UpstreamProxy::parse(spec)
-        .map(Some)
-        .with_context(|| format!("Failed to parse {name}"))
-}
-
 impl UpstreamProxy {
     /// Parse an upstream proxy specification such as `http://proxy.corp:3128`,
-    /// `http://user:pass@proxy.corp:3128` or a bare `proxy.corp:3128` (the
-    /// `http` scheme is then assumed).
-    ///
-    /// Reaching the proxy itself over TLS (an `https://` proxy URL) is not
-    /// supported; HTTPS *destinations* are tunneled through a plain HTTP proxy
-    /// with `CONNECT`.
+    /// `http://user:pass@proxy.corp:3128`, `https://proxy.corp:8443` or a bare
+    /// `proxy.corp:3128` (the `http` scheme is then assumed).
     pub fn parse(spec: &str) -> Result<Self> {
         let spec = spec.trim();
         if spec.is_empty() {
@@ -381,20 +98,15 @@ impl UpstreamProxy {
         let url = Url::parse(&normalized)
             .with_context(|| format!("Invalid upstream proxy URL: {}", redacted_spec))?;
 
-        match url.scheme() {
-            "http" => {}
-            "https" => bail!(
-                "Connecting to an upstream proxy over TLS is not supported: {}. \
-                 Use an 'http://' proxy URL; HTTPS destinations are still \
-                 tunneled through it with CONNECT.",
-                redacted_spec
-            ),
+        let tls = match url.scheme() {
+            "http" => false,
+            "https" => true,
             other => bail!(
                 "Unsupported upstream proxy scheme '{}': {}",
                 other,
                 redacted_spec
             ),
-        }
+        };
 
         let host = match url.host() {
             Some(Host::Domain(host)) => host.to_string(),
@@ -413,7 +125,12 @@ impl UpstreamProxy {
             None
         };
 
-        Ok(UpstreamProxy { host, port, auth })
+        Ok(UpstreamProxy {
+            host,
+            port,
+            tls,
+            auth,
+        })
     }
 
     /// The `Proxy-Authorization` header value, if credentials were supplied.
@@ -444,17 +161,11 @@ pub fn redact_proxy_spec(spec: &str) -> String {
 /// Build a `Proxy-Authorization: Basic ...` header value from `user:pass`
 /// userinfo, percent-decoding each component first.
 fn build_basic_auth(user: &str, pass: Option<&str>) -> Result<HeaderValue> {
-    let user = percent_decode_str(user).collect::<Vec<_>>();
-    let pass = percent_decode_str(pass.unwrap_or("")).collect::<Vec<_>>();
-    let mut credentials = Vec::with_capacity(user.len() + 1 + pass.len());
-    credentials.extend_from_slice(&user);
-    credentials.push(b':');
-    credentials.extend_from_slice(&pass);
-    let token = STANDARD.encode(credentials);
-    let mut value = HeaderValue::from_str(&format!("Basic {}", token))
-        .context("Invalid characters in upstream proxy credentials")?;
-    value.set_sensitive(true);
-    Ok(value)
+    let user = percent_decode_str(user).decode_utf8_lossy();
+    let pass = percent_decode_str(pass.unwrap_or("")).decode_utf8_lossy();
+    let token = STANDARD.encode(format!("{user}:{pass}"));
+    HeaderValue::from_str(&format!("Basic {}", token))
+        .context("Invalid characters in upstream proxy credentials")
 }
 
 /// A hyper connector that routes outbound connections through an
@@ -468,63 +179,13 @@ fn build_basic_auth(user: &str, pass: Option<&str>) -> Result<HeaderValue> {
 pub struct ProxyConnector {
     /// Used solely to dial the proxy's `host:port` (never the destination).
     http: HttpConnector,
-    proxies: Arc<UpstreamProxies>,
-}
-
-/// Bound the complete connection setup performed by an inner connector.
-///
-/// Wrapping the final HTTPS connector, rather than [`UpstreamClient::request`],
-/// includes the destination TLS handshake without placing a deadline on the
-/// established connection or its request/response streams.
-#[derive(Clone)]
-pub struct ConnectionSetupTimeout<C> {
-    inner: C,
-    duration: Duration,
-}
-
-impl<C> ConnectionSetupTimeout<C> {
-    pub(crate) fn new(inner: C) -> Self {
-        Self {
-            inner,
-            duration: PROXY_SETUP_TIMEOUT,
-        }
-    }
-
-    #[cfg(test)]
-    fn with_timeout(inner: C, duration: Duration) -> Self {
-        Self { inner, duration }
-    }
-}
-
-impl<C> Service<Uri> for ConnectionSetupTimeout<C>
-where
-    C: Service<Uri>,
-    C::Future: Send + 'static,
-    C::Response: Send + 'static,
-    C::Error: Into<BoxError>,
-{
-    type Response = C::Response;
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output = Result<C::Response, BoxError>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx).map_err(Into::into)
-    }
-
-    fn call(&mut self, dst: Uri) -> Self::Future {
-        let connect = self.inner.call(dst);
-        let duration = self.duration;
-        Box::pin(async move {
-            match timeout(duration, connect).await {
-                Ok(result) => result.map_err(Into::into),
-                Err(_) => Err(timed_out("establishing connection")),
-            }
-        })
-    }
+    proxy: Arc<UpstreamProxy>,
+    /// TLS configuration used only when the proxy itself is `https://`.
+    proxy_tls: Arc<rustls::ClientConfig>,
 }
 
 impl ProxyConnector {
-    pub(crate) fn with_config(proxies: UpstreamProxies) -> Self {
+    pub fn new(proxy: UpstreamProxy, proxy_tls: Arc<rustls::ClientConfig>) -> Self {
         let mut http = HttpConnector::new();
         // The proxy is addressed via an http(s) URL; allow non-http schemes so
         // the connector does not reject the dial target.
@@ -532,7 +193,8 @@ impl ProxyConnector {
         http.set_happy_eyeballs_timeout(Some(Duration::from_millis(250)));
         ProxyConnector {
             http,
-            proxies: Arc::new(proxies),
+            proxy: Arc::new(proxy),
+            proxy_tls,
         }
     }
 }
@@ -548,48 +210,54 @@ impl Service<Uri> for ProxyConnector {
 
     fn call(&mut self, dst: Uri) -> Self::Future {
         let mut http = self.http.clone();
-        let proxy = self.proxies.proxy_for_uri(&dst).cloned();
+        let proxy = Arc::clone(&self.proxy);
+        let proxy_tls = Arc::clone(&self.proxy_tls);
 
         Box::pin(async move {
-            let Some(proxy) = proxy else {
-                let tcp = match timeout(PROXY_SETUP_TIMEOUT, http.call(dst.clone())).await {
-                    Ok(result) => result?.into_inner(),
-                    Err(_) => return Err(timed_out("connecting directly to destination")),
-                };
-                let _ = tcp.set_nodelay(true);
-                return Ok(ProxyStream::new(tcp, Bytes::new(), false));
-            };
-
             // Dial the proxy (TCP). The destination scheme is irrelevant here;
             // we always connect to the proxy's host:port.
-            let proxy_uri: Uri =
-                format!("http://{}", host_port_authority(&proxy.host, proxy.port)).parse()?;
-            let mut stream = match timeout(PROXY_SETUP_TIMEOUT, http.call(proxy_uri)).await {
+            let proxy_uri: Uri = format!("http://{}", host_port_authority(&proxy.host, proxy.port))
+                .parse()?;
+            let tcp = match timeout(PROXY_SETUP_TIMEOUT, http.call(proxy_uri)).await {
                 Ok(result) => result?.into_inner(),
                 Err(_) => return Err(timed_out("connecting to upstream proxy")),
             };
-            let _ = stream.set_nodelay(true);
+            let _ = tcp.set_nodelay(true);
 
-            let (prefetched, proxied) = if dst.scheme_str() == Some("https") {
-                let host = uri_host(&dst).ok_or_else(|| {
+            // Optionally negotiate TLS with the proxy itself.
+            let mut stream: BoxedIo = if proxy.tls {
+                let name = ServerName::try_from(proxy.host.clone()).map_err(|_| {
+                    BoxError::from(format!("Invalid proxy host for TLS SNI: {}", proxy.host))
+                })?;
+                let connector = TlsConnector::from(Arc::clone(&proxy_tls));
+                let tls = match timeout(PROXY_SETUP_TIMEOUT, connector.connect(name, tcp)).await {
+                    Ok(result) => result?,
+                    Err(_) => return Err(timed_out("during TLS handshake with upstream proxy")),
+                };
+                Box::new(tls)
+            } else {
+                Box::new(tcp)
+            };
+
+            let proxied = if dst.scheme_str() == Some("https") {
+                let host = dst.host().ok_or_else(|| {
                     BoxError::from(format!("CONNECT target has no host: {}", dst))
                 })?;
                 let port = dst.port_u16().unwrap_or(443);
-                let prefetched =
-                    establish_connect_tunnel(&mut stream, host, port, proxy.auth.as_ref())
-                        .await
-                        .map_err(|e| -> BoxError { e.into() })?;
+                establish_connect_tunnel(&mut stream, host, port, proxy.auth.as_ref())
+                    .await
+                    .map_err(|e| -> BoxError { e.into() })?;
                 // The tunnel is transparent end-to-end; destination TLS is
                 // layered on top by the surrounding HttpsConnector and the
                 // request is sent in origin-form, so do not mark it proxied.
-                (prefetched, false)
+                false
             } else {
                 // Plain HTTP: the proxy forwards absolute-form requests. Mark the
                 // connection proxied so hyper emits absolute-form request lines.
-                (Bytes::new(), true)
+                true
             };
 
-            Ok(ProxyStream::new(stream, prefetched, proxied))
+            Ok(ProxyStream::new(stream, proxied))
         })
     }
 }
@@ -602,19 +270,14 @@ fn timed_out(phase: &str) -> BoxError {
 /// The connector's response: a byte stream plus the proxied flag that hyper
 /// consults to decide between absolute-form and origin-form request lines.
 pub struct ProxyStream {
-    io: TokioIo<TcpStream>,
-    /// Tunnel bytes read ahead of time while consuming the `CONNECT` response.
-    /// Replayed before anything is taken from the socket so the byte order the
-    /// destination TLS handshake sees is unchanged.
-    prefetched: Bytes,
+    io: TokioIo<BoxedIo>,
     proxied: bool,
 }
 
 impl ProxyStream {
-    fn new(io: TcpStream, prefetched: Bytes, proxied: bool) -> Self {
+    fn new(io: BoxedIo, proxied: bool) -> Self {
         ProxyStream {
             io: TokioIo::new(io),
-            prefetched,
             proxied,
         }
     }
@@ -630,21 +293,9 @@ impl Read for ProxyStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        mut buf: ReadBufCursor<'_>,
+        buf: ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-
-        // Drain the read-ahead first, and return without touching the socket
-        // while any of it remains. Mixing the two in one poll would reorder the
-        // stream.
-        if !this.prefetched.is_empty() {
-            let take = this.prefetched.len().min(buf.remaining());
-            buf.put_slice(&this.prefetched[..take]);
-            this.prefetched.advance(take);
-            return Poll::Ready(Ok(()));
-        }
-
-        Pin::new(&mut this.io).poll_read(cx, buf)
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
     }
 }
 
@@ -678,17 +329,14 @@ impl Write for ProxyStream {
     }
 }
 
-/// Send a `CONNECT` request to the upstream proxy and validate its response.
-///
-/// Returns any tunnel bytes that arrived in the same read as the end of the
-/// response headers. Those bytes belong to the tunnel and must be replayed
-/// before anything further is read from `stream`; see [`ProxyStream`].
+/// Send a `CONNECT` request to the upstream proxy and validate its response,
+/// leaving `stream` positioned at the start of the tunnel payload on success.
 async fn establish_connect_tunnel<S>(
     stream: &mut S,
     host: &str,
     port: u16,
     auth: Option<&HeaderValue>,
-) -> Result<Bytes>
+) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -715,49 +363,29 @@ where
         Err(_) => bail!("Timeout flushing CONNECT request to upstream proxy"),
     }
 
-    // One timeout for the whole exchange rather than one per read: a proxy that
-    // dribbles the response out a byte at a time would otherwise never trip a
-    // per-read deadline and could hold the setup open indefinitely.
-    let response = match timeout(PROXY_SETUP_TIMEOUT, read_connect_response(stream)).await {
+    let status = match timeout(PROXY_SETUP_TIMEOUT, read_connect_status(stream)).await {
         Ok(result) => result?,
         Err(_) => bail!("Timeout reading CONNECT response from upstream proxy"),
     };
 
-    if !(200..300).contains(&response.status) {
+    if !(200..300).contains(&status) {
         bail!(
             "Upstream proxy refused CONNECT to {}:{} with status {}",
             host,
             port,
-            response.status
+            status
         );
     }
 
     debug!(
-        "Established CONNECT tunnel to {}:{} via upstream proxy ({} byte(s) of tunnel data already read)",
-        host,
-        port,
-        response.prefetched.len()
+        "Established CONNECT tunnel to {}:{} via upstream proxy",
+        host, port
     );
-    Ok(response.prefetched)
-}
-
-/// The destination host as a bare host name or IP literal.
-///
-/// [`Uri::host`] keeps the square brackets that URI syntax requires around an
-/// IPv6 literal (`https://[::1]/` yields `[::1]`), so the brackets are stripped
-/// here to obtain the host itself. [`host_port_authority`] adds them back when
-/// the host is used in an authority position.
-fn uri_host(uri: &Uri) -> Option<&str> {
-    uri.host().map(|host| {
-        host.strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host)
-    })
+    Ok(())
 }
 
 /// Format a host and port for use as an HTTP authority, bracketing IPv6
-/// literals as required by URI syntax. `host` must be a bare host (see
-/// [`uri_host`]); an already-bracketed literal would be bracketed twice.
+/// literals as required by URI syntax.
 fn host_port_authority(host: &str, port: u16) -> String {
     if host.contains(':') {
         format!("[{host}]:{port}")
@@ -766,127 +394,50 @@ fn host_port_authority(host: &str, port: u16) -> String {
     }
 }
 
-/// The proxy's answer to `CONNECT`, plus whatever came after it.
-struct ConnectResponse {
-    status: u16,
-    /// Tunnel bytes that arrived in the same read as the end of the headers.
-    /// Reading in chunks means the response and the first tunnel data can land
-    /// together; discarding the remainder would corrupt the TLS handshake that
-    /// follows.
-    prefetched: Bytes,
-}
-
-/// Read the proxy's `CONNECT` response up to the end of its headers.
-///
-/// Reads in chunks of [`CONNECT_READ_CHUNK_BYTES`] rather than a byte at a time,
-/// and hands back the bytes that overshot the headers instead of dropping them.
-/// The headers themselves are capped at [`MAX_CONNECT_RESPONSE_BYTES`], so memory
-/// stays within that plus one chunk.
-async fn read_connect_response<S>(stream: &mut S) -> Result<ConnectResponse>
+/// Read the proxy's `CONNECT` response up to the end of its headers and return
+/// the HTTP status code. Reads are bounded by [`MAX_CONNECT_RESPONSE_BYTES`] to
+/// avoid consuming tunnel payload and to bound memory.
+async fn read_connect_status<S>(stream: &mut S) -> Result<u16>
 where
     S: AsyncRead + Unpin,
 {
-    const TERMINATOR: &[u8] = b"\r\n\r\n";
-
-    let mut buf = BytesMut::with_capacity(CONNECT_READ_CHUNK_BYTES);
-    let header_end = loop {
-        let filled = buf.len();
-
-        // `BytesMut` reports nearly unbounded space, so cap each read explicitly
-        // rather than letting it size the read for us.
-        let mut chunk = (&mut buf).limit(CONNECT_READ_CHUNK_BYTES);
-        if stream.read_buf(&mut chunk).await? == 0 {
+    let mut buf = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
             bail!("Upstream proxy closed connection during CONNECT");
         }
-
-        // A terminator can straddle two reads, so rescan the last three bytes of
-        // what was already there instead of only the newly added bytes.
-        let search_from = filled.saturating_sub(TERMINATOR.len() - 1);
-        if let Some(offset) = find_subslice(&buf[search_from..], TERMINATOR) {
-            break search_from + offset + TERMINATOR.len();
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
         }
-
-        // Only reached with no terminator in hand: everything read so far is
-        // header, so the cap applies to all of it.
-        if buf.len() >= MAX_CONNECT_RESPONSE_BYTES {
+        if buf.len() > MAX_CONNECT_RESPONSE_BYTES {
             bail!("Upstream proxy CONNECT response exceeded size limit");
         }
-    };
-
-    // Checked after the terminator is located, not before: a single read may
-    // carry headers within the cap plus tunnel data that pushes the total over
-    // it, and that case is a success.
-    if header_end > MAX_CONNECT_RESPONSE_BYTES {
-        bail!("Upstream proxy CONNECT response exceeded size limit");
     }
 
-    let prefetched = buf.split_off(header_end).freeze();
-
-    // HTTP field values may contain obs-text bytes, so only parse the status
-    // code token as text. The tunnel bytes are arbitrary binary as well (a TLS
-    // ClientHello, typically) and must never be run through a UTF-8 check.
-    let first_line_end = find_subslice(&buf, b"\r\n").unwrap_or(buf.len());
-    let first_line = &buf[..first_line_end];
-    let status = first_line
-        .split(|byte| byte.is_ascii_whitespace())
-        .filter(|token| !token.is_empty())
+    // Parse the status code from the first line, e.g.
+    // `HTTP/1.1 200 Connection established`.
+    let head = std::str::from_utf8(&buf).context("Non-UTF8 CONNECT response")?;
+    let first_line = head.lines().next().unwrap_or("");
+    first_line
+        .split_whitespace()
         .nth(1)
-        .and_then(|code| std::str::from_utf8(code).ok())
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| {
-            anyhow!(
-                "Malformed CONNECT status line: {:?}",
-                String::from_utf8_lossy(first_line)
-            )
-        })?;
-
-    Ok(ConnectResponse { status, prefetched })
-}
-
-/// Index of the first occurrence of `needle` in `haystack`.
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+        .ok_or_else(|| anyhow!("Malformed CONNECT status line: {:?}", first_line))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[derive(Clone)]
-    struct StalledConnector;
-
-    impl Service<Uri> for StalledConnector {
-        type Response = ();
-        type Error = io::Error;
-        type Future = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
-
-        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, _dst: Uri) -> Self::Future {
-            Box::pin(std::future::pending())
-        }
-    }
-
-    #[tokio::test]
-    async fn connection_setup_timeout_includes_inner_connector() {
-        let mut connector =
-            ConnectionSetupTimeout::with_timeout(StalledConnector, Duration::from_millis(10));
-        let err = connector
-            .call("https://target.test".parse().unwrap())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Timeout establishing connection"));
-    }
-
     #[test]
     fn parse_plain_proxy() {
         let p = UpstreamProxy::parse("http://proxy.corp:3128").unwrap();
         assert_eq!(p.host, "proxy.corp");
         assert_eq!(p.port, 3128);
+        assert!(!p.tls);
         assert!(p.auth.is_none());
     }
 
@@ -895,6 +446,7 @@ mod tests {
         let p = UpstreamProxy::parse("http://proxy.corp:3128/path?ignored=true#frag").unwrap();
         assert_eq!(p.host, "proxy.corp");
         assert_eq!(p.port, 3128);
+        assert!(!p.tls);
     }
 
     #[test]
@@ -902,18 +454,14 @@ mod tests {
         let p = UpstreamProxy::parse("proxy.corp:8080").unwrap();
         assert_eq!(p.host, "proxy.corp");
         assert_eq!(p.port, 8080);
+        assert!(!p.tls);
     }
 
-    /// Reaching the proxy itself over TLS is not supported; the error must say
-    /// so rather than silently treating the proxy as plain HTTP.
     #[test]
-    fn reject_tls_proxy_scheme() {
-        let err = UpstreamProxy::parse("https://proxy.corp:8443").unwrap_err();
-        assert!(
-            err.to_string().contains("over TLS is not supported"),
-            "unexpected error: {}",
-            err
-        );
+    fn parse_https_proxy_default_port() {
+        let p = UpstreamProxy::parse("https://proxy.corp").unwrap();
+        assert!(p.tls);
+        assert_eq!(p.port, 443);
     }
 
     #[test]
@@ -947,20 +495,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_credentials_preserves_non_utf8_octets() {
-        let p = UpstreamProxy::parse("http://%FF:%80@proxy.corp:3128").unwrap();
-        // base64([0xff, b':', 0x80])
-        assert_eq!(p.auth.unwrap().to_str().unwrap(), "Basic /zqA");
-    }
-
-    #[test]
-    fn proxy_credentials_are_sensitive() {
-        let p = UpstreamProxy::parse("http://user:secret@proxy.corp:3128").unwrap();
-        assert!(p.auth.as_ref().unwrap().is_sensitive());
-        assert!(!format!("{p:?}").contains("dXNlcjpzZWNyZXQ="));
-    }
-
-    #[test]
     fn redact_proxy_spec_removes_userinfo() {
         assert_eq!(
             redact_proxy_spec("http://user:secret@proxy.corp:3128/path"),
@@ -984,214 +518,6 @@ mod tests {
     #[test]
     fn reject_empty_spec() {
         assert!(UpstreamProxy::parse("   ").is_err());
-    }
-
-    #[test]
-    fn proxy_config_uses_specs_by_scheme() {
-        let proxies = UpstreamProxies::from_specs(
-            Some("http://http-proxy.corp:3128"),
-            Some("http://https-proxy.corp:8443"),
-            None,
-        )
-        .unwrap()
-        .unwrap();
-
-        let http_uri: Uri = "http://example.com/".parse().unwrap();
-        let https_uri: Uri = "https://example.com/".parse().unwrap();
-
-        assert_eq!(
-            proxies
-                .proxy_for_uri(&http_uri)
-                .map(|proxy| proxy.host.as_str()),
-            Some("http-proxy.corp")
-        );
-        assert_eq!(
-            proxies
-                .proxy_for_uri(&https_uri)
-                .map(|proxy| proxy.host.as_str()),
-            Some("https-proxy.corp")
-        );
-    }
-
-    #[test]
-    fn proxy_config_ignores_empty_specs() {
-        let proxies = UpstreamProxies::from_specs(Some("  "), None, None).unwrap();
-        assert!(proxies.is_none());
-    }
-
-    fn proxies_with_no_proxy(no_proxy: &str) -> UpstreamProxies {
-        UpstreamProxies::from_specs(
-            Some("http://user:pass@proxy.corp:3128"),
-            Some("http://proxy.corp:3128"),
-            Some(no_proxy),
-        )
-        .unwrap()
-        .unwrap()
-    }
-
-    /// Bypass matching, asserted through `proxy_for_uri` rather than the matcher
-    /// itself: that is the entry point both the connector and the
-    /// `Proxy-Authorization` decision go through.
-    #[test]
-    fn no_proxy_bypasses_matching_destinations() {
-        // (NO_PROXY, destination, bypassed?)
-        let cases = [
-            // Apex, subdomain and the non-boundary near-miss.
-            ("example.com", "http://example.com/", true),
-            ("example.com", "http://www.example.com/", true),
-            ("example.com", "http://notexample.com/", false),
-            ("EXAMPLE.COM", "http://ExAmPlE.cOm/", true),
-            // One leading and one trailing dot are ignored, on either side.
-            (".example.com", "http://www.example.com/", true),
-            ("example.com.", "http://example.com/", true),
-            ("example.com", "http://example.com./", true),
-            // Only a list that is exactly "*" is a wildcard. `" * "` and a list
-            // containing `*` leave the token as an unmatchable domain entry.
-            (" * ", "http://anything.test/", false),
-            ("*,example.com", "http://anything.test/", false),
-            ("*,example.com", "http://example.com/", true),
-            // Addresses: CIDR, bare address, and non-byte-aligned prefixes,
-            // which curl <= 8.16.0 got backwards.
-            ("192.168.0.0/16", "http://192.168.4.5/", true),
-            ("192.168.0.0/16", "http://192.169.4.5/", false),
-            ("192.168.1.1", "http://192.168.1.1/", true),
-            ("192.168.1.1", "http://192.168.1.2/", false),
-            // A bare address is read as a domain when the destination is a host
-            // name, so it covers names ending in it — still at a label boundary.
-            ("127.0.0.1", "http://foo.127.0.0.1/", true),
-            ("127.0.0.1", "http://127.0.0.1./", true),
-            ("127.0.0.1", "http://x127.0.0.1/", false),
-            ("2001:db8::/32", "http://[2001:db8::1]/", true),
-            ("2001:db8::/32", "http://[2001:db9::1]/", false),
-            ("2001:db8::/65", "http://[2001:db8::1]/", true),
-            ("2001:db8::/65", "http://[2001:db8:0:0:8000::1]/", false),
-            ("::1/127", "http://[::1]/", true),
-            // Domain entries never match addresses and vice versa.
-            ("example.com", "http://192.168.1.1/", false),
-            ("192.168.0.0/16", "http://example.com/", false),
-            // Nothing here may degenerate into matching every host.
-            ("", "http://example.com/", false),
-            (".", "http://example.com/", false),
-            ("..", "http://example.com/", false),
-            (",,example.com,", "http://example.com/", true),
-            (",,example.com,", "http://other.test/", false),
-            // Unlike curl, whitespace separates instead of truncating the list.
-            ("a.test b.test", "http://a.test/", true),
-            ("a.test b.test", "http://b.test/", true),
-            // Entries that cannot match a host name are dropped, not errors.
-            ("https://internal.corp", "http://internal.corp/", false),
-            ("example.com:8080", "http://example.com/", false),
-            // The bypass applies to both schemes.
-            ("example.com", "https://example.com/", true),
-        ];
-
-        for (no_proxy, destination, bypassed) in cases {
-            let proxies = proxies_with_no_proxy(no_proxy);
-            let uri: Uri = destination.parse().unwrap();
-            assert_eq!(
-                proxies.proxy_for_uri(&uri).is_none(),
-                bypassed,
-                "NO_PROXY={:?} destination={}",
-                no_proxy,
-                destination
-            );
-        }
-    }
-
-    /// `Proxy-Authorization` must never leave the proxy it belongs to. Expected
-    /// values are written out rather than derived, so a wrong rule in
-    /// `http_auth_for_uri` cannot make the test agree with it.
-    #[test]
-    fn proxy_auth_only_for_proxied_http_destinations() {
-        let proxies = proxies_with_no_proxy("internal.corp");
-
-        // Forwarded in absolute-form to the proxy: the header belongs here.
-        assert!(
-            proxies
-                .http_auth_for_uri(&"http://proxied.example/".parse().unwrap())
-                .is_some()
-        );
-        // Connected to directly: the proxy's credentials must not be sent.
-        assert!(
-            proxies
-                .http_auth_for_uri(&"http://internal.corp/".parse().unwrap())
-                .is_none()
-        );
-        // Sent inside a CONNECT tunnel, i.e. to the origin server itself.
-        assert!(
-            proxies
-                .http_auth_for_uri(&"https://proxied.example/".parse().unwrap())
-                .is_none()
-        );
-        assert!(
-            proxies
-                .http_auth_for_uri(&"https://internal.corp/".parse().unwrap())
-                .is_none()
-        );
-    }
-
-    /// Configuration errors, and the inputs that must *not* become errors.
-    #[test]
-    fn no_proxy_configuration_errors() {
-        let proxy = Some("http://proxy.corp:3128");
-        let parse = |no_proxy: &str| UpstreamProxies::from_specs(proxy, proxy, Some(no_proxy));
-
-        // A mistyped CIDR is a typo worth reporting, not something to ignore.
-        for invalid in ["10.0.0.0/8x", "10.0.0.0/33", "2001:db8::/129"] {
-            assert!(parse(invalid).is_err(), "expected error for {:?}", invalid);
-        }
-
-        // Entries that merely cannot match must not refuse to start: curl
-        // tolerates them, and httpjail would otherwise be unusable wherever such
-        // a value is set globally.
-        for tolerated in ["https://internal.corp", "foo/bar", "", ".", "*,example.com"] {
-            assert!(
-                parse(tolerated).is_ok(),
-                "unexpected error for {tolerated:?}"
-            );
-        }
-
-        // Nothing is parsed that cannot affect the outcome: no proxy at all, and
-        // a wildcard bypass, both short-circuit before the invalid values are
-        // reached.
-        assert!(
-            UpstreamProxies::from_specs(None, None, Some("10.0.0.0/8x"))
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            UpstreamProxies::from_specs(Some("http://["), None, Some("*"))
-                .unwrap()
-                .is_none()
-        );
-
-        // A NO_PROXY value can hold a pasted proxy URL, so the error must not
-        // echo the entry.
-        // `{:#}` renders the whole chain, which is what reaches the user.
-        let err = format!("{:#}", parse("10.0.0.0/8@user:pass").unwrap_err());
-        assert!(
-            !err.contains("user") && !err.contains("pass"),
-            "credentials leaked into error: {err}"
-        );
-        assert!(
-            err.contains("10.0.0.0"),
-            "error lacks the entry position: {err}"
-        );
-    }
-
-    /// The uppercase spelling wins, and the value survives untouched. Shared by
-    /// every proxy variable, so this fixes the precedence for all of them.
-    #[test]
-    fn uppercase_env_spelling_wins() {
-        assert_eq!(first_set(Some("upper"), Some("lower")), Some("upper"));
-        assert_eq!(first_set(None, Some("lower")), Some("lower"));
-        assert_eq!(first_set(Some(""), Some("lower")), Some("lower"));
-        // Unlike curl, a whitespace-only value does not shadow the other spelling.
-        assert_eq!(first_set(Some("   "), Some("lower")), Some("lower"));
-        assert_eq!(first_set(None, None), None);
-        assert_eq!(first_set(Some(""), Some("  ")), None);
-        // Returned verbatim: trimming here would turn `" * "` into a wildcard.
-        assert_eq!(first_set(Some(" * "), None), Some(" * "));
     }
 
     /// Drive the proxy side of an in-memory duplex: read request headers up to
@@ -1234,110 +560,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_tunnel_accepts_non_utf8_header_values() {
-        let (mut client_end, proxy_end) = tokio::io::duplex(1024);
-        tokio::spawn(fake_proxy(
-            proxy_end,
-            b"HTTP/1.1 200 Connection established\r\nX-Binary: \xff\r\n\r\n",
-        ));
-
-        establish_connect_tunnel(&mut client_end, "example.com", 443, None)
-            .await
-            .unwrap();
-    }
-
-    /// An IPv6 literal destination must reach the proxy as `[::1]:443`, taking
-    /// the host from the destination `Uri` exactly as the connector does.
-    /// `Uri::host()` returns the literal already bracketed, so feeding it
-    /// straight into the authority would produce `[[::1]]:443`.
-    #[tokio::test]
-    async fn connect_tunnel_brackets_ipv6_literal_from_uri() {
+    async fn connect_tunnel_brackets_ipv6_literal() {
         let (mut client_end, proxy_end) = tokio::io::duplex(1024);
         let proxy = tokio::spawn(fake_proxy(
             proxy_end,
             b"HTTP/1.1 200 Connection established\r\n\r\n",
         ));
 
-        let dst: Uri = "https://[::1]/".parse().unwrap();
-        let host = uri_host(&dst).unwrap();
-        assert_eq!(host, "::1");
-
-        establish_connect_tunnel(&mut client_end, host, dst.port_u16().unwrap_or(443), None)
+        establish_connect_tunnel(&mut client_end, "::1", 443, None)
             .await
             .unwrap();
 
         let request = proxy.await.unwrap();
-        assert!(
-            request.starts_with("CONNECT [::1]:443 HTTP/1.1\r\n"),
-            "unexpected request: {request}"
-        );
-        assert!(request.contains("Host: [::1]:443\r\n"));
-    }
-
-    /// Reading in chunks can pull tunnel data in with the response headers. Those
-    /// bytes belong to the TLS handshake that follows and must survive intact,
-    /// including bytes that are not valid UTF-8.
-    #[tokio::test]
-    async fn connect_tunnel_returns_bytes_read_past_the_headers() {
-        const TUNNEL: &[u8] = &[0x16, 0x03, 0x01, 0x00, 0xff, 0x00, 0x80];
-
-        let (mut client_end, mut proxy_end) = tokio::io::duplex(1024);
-        let proxy = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut byte = [0u8; 1];
-            while proxy_end.read(&mut byte).await.unwrap() != 0 {
-                buf.push(byte[0]);
-                if buf.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            // Headers and tunnel data in a single write, so they arrive together.
-            let mut response = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
-            response.extend_from_slice(TUNNEL);
-            proxy_end.write_all(&response).await.unwrap();
-            proxy_end.flush().await.unwrap();
-        });
-
-        let prefetched = establish_connect_tunnel(&mut client_end, "example.com", 443, None)
-            .await
-            .unwrap();
-
-        assert_eq!(prefetched.as_ref(), TUNNEL);
-        proxy.await.unwrap();
-    }
-
-    /// The read-ahead has to come out before anything from the socket, and has to
-    /// survive being read in pieces smaller than itself.
-    #[tokio::test]
-    async fn proxy_stream_replays_prefetched_bytes_before_socket_bytes() {
-        use tokio::io::AsyncReadExt as _;
-
-        const PREFIX: &[u8] = b"prefetched-";
-        const BODY: &[u8] = b"from-socket";
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut sock, _) = listener.accept().await.unwrap();
-            sock.write_all(BODY).await.unwrap();
-            sock.flush().await.unwrap();
-        });
-
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let stream = ProxyStream::new(client, Bytes::from_static(PREFIX), false);
-        let mut io = TokioIo::new(stream);
-
-        // Deliberately smaller than the prefix so the replay spans several reads.
-        let mut got = Vec::new();
-        let mut chunk = [0u8; 4];
-        while got.len() < PREFIX.len() + BODY.len() {
-            let n = io.read(&mut chunk).await.unwrap();
-            assert_ne!(n, 0, "stream ended early: {:?}", got);
-            got.extend_from_slice(&chunk[..n]);
-        }
-
-        assert_eq!(got, [PREFIX, BODY].concat());
-        server.await.unwrap();
+        assert!(request.starts_with("CONNECT [::1]:443 HTTP/1.1\r\n"));
     }
 
     #[tokio::test]

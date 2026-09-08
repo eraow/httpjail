@@ -7,7 +7,7 @@ httpjail's behavior can be configured through command-line options, environment 
 httpjail follows a simple configuration hierarchy:
 
 1. **Command-line options** - Highest priority, override everything
-2. **Environment variables** - Configure httpjail and the jailed process
+2. **Environment variables** - Set by httpjail for the jailed process
 
 ## Key Configuration Areas
 
@@ -72,11 +72,9 @@ httpjail --proc ./rate-limiter.py \
 
 ## Environment Variables
 
-### Set for the jailed process
+### Set by httpjail
 
-These are set in the jailed process where applicable. In weak mode, httpjail
-sets proxy variables so applications talk to httpjail. On Linux strong mode,
-traffic is redirected transparently without setting proxy variables.
+These are automatically set in the jailed process:
 
 | Variable        | Description                  | Example                  |
 | --------------- | ---------------------------- | ------------------------ |
@@ -84,18 +82,9 @@ traffic is redirected transparently without setting proxy variables.
 | `HTTPS_PROXY`   | HTTPS proxy address          | `http://127.0.0.1:34567` |
 | `SSL_CERT_FILE` | CA certificate path          | `/tmp/httpjail-ca.pem`   |
 | `SSL_CERT_DIR`  | CA certificate directory     | `/tmp/httpjail-certs/`   |
-| `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1,::1` |
+| `NO_PROXY`      | Bypass proxy for these hosts | `localhost,127.0.0.1`    |
 
-The parent's proxy variables are never inherited by the jailed process:
-`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` are removed (in both spellings) so
-cooperating applications do not use the upstream proxy directly, and `NO_PROXY`
-is set to the local addresses only rather than merged with the parent's value,
-which would let the process bypass httpjail. This does not hide the parent
-process's environment from an untrusted command. Neither weak nor strong mode
-provides process credential isolation from httpjail itself; access depends on
-the platform, UID setup and other OS controls.
-
-### Consumed by httpjail
+### Controlling httpjail
 
 These affect httpjail's behavior:
 
@@ -103,18 +92,11 @@ These affect httpjail's behavior:
 | ------------------------ | -------------------------------------- | -------------------------------- |
 | `RUST_LOG`               | Logging level                          | `debug`, `info`, `warn`, `error` |
 | `HTTPJAIL_CA_CERT`       | Custom CA certificate path             | `/etc/pki/custom-ca.pem`         |
-| `HTTP_PROXY`             | Upstream proxy for httpjail HTTP egress | `http://proxy.corp:3128`        |
-| `HTTPS_PROXY`            | Upstream proxy for httpjail HTTPS egress | `http://proxy.corp:3128`       |
-| `NO_PROXY`               | Destinations httpjail contacts directly | `internal.corp,10.0.0.0/8`      |
+| `HTTPJAIL_UPSTREAM_PROXY`| Upstream proxy for httpjail's egress   | `http://proxy.corp:3128`         |
 
-`NO_PROXY` appears in both tables and means two different things. In the table
-above it is what httpjail *sets* for the jailed process, so that the process does
-not send its localhost traffic to httpjail. Here it is what httpjail *reads* for
-its own egress, to decide which destinations to reach without the upstream proxy.
-The value you set is used only for httpjail's own egress; it is not passed on to
-the jailed process, which would let that process bypass httpjail entirely.
-
-See [Upstream Proxy](../advanced/upstream-proxy.md) for details.
+The `--upstream-proxy` command-line flag takes precedence over
+`HTTPJAIL_UPSTREAM_PROXY`. See [Upstream Proxy](../advanced/upstream-proxy.md)
+for details.
 
 ## Platform-Specific Configuration
 
